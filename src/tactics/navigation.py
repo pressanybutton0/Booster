@@ -99,8 +99,12 @@ class ObstacleCollector:
         half_length = self.config.field_length / 2.0
         half_goal_width = self.config.goal_width / 2.0
         goal_depth = 0.6  #  Rule doc note/3v3_rule.md: goal depth is 0.6 m.
-        post_radius = 0.18
-        net_radius = 0.20
+        # These radii include the robot footprint, rather than modelling only the
+        # thin physical post/net.  The common safety margin is added later by the
+        # corridor checker.  This leaves enough room for a biped body to turn
+        # without its shoulders clipping the frame.
+        post_radius = 0.30
+        net_radius = 0.30
         net_step = 0.35
 
         obstacles: list[Obstacle] = []
@@ -109,10 +113,18 @@ class ObstacleCollector:
             back_x = sign_x * (half_length + goal_depth)
             for sign_y in (-1.0, 1.0):
                 obstacles.append(
-                    Obstacle(x=front_x, y=sign_y * half_goal_width, radius=post_radius)
+                    Obstacle(
+                        x=front_x,
+                        y=sign_y * half_goal_width,
+                        radius=post_radius,
+                    )
                 )
                 obstacles.append(
-                    Obstacle(x=back_x, y=sign_y * half_goal_width, radius=post_radius)
+                    Obstacle(
+                        x=back_x,
+                        y=sign_y * half_goal_width,
+                        radius=post_radius,
+                    )
                 )
             obstacles.extend(
                 _sample_net_segment(

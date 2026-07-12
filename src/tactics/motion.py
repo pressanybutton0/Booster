@@ -49,6 +49,14 @@ _LINEAR_SPEED_FLOOR = 0.3
 _LINEAR_GAIN = 0.9
 _MAX_ALIGN_TIME = 2.0  # Maximum time spent aligning before forcing arrival
 
+# The goal is a U-shaped trap.  Once the robot overlaps it, ordinary tangent
+# avoidance cannot recover because close obstacles are deliberately ignored to
+# suppress robot-vs-robot jitter.  These values put the temporary target safely
+# inside the pitch (or outside the side net) before normal planning resumes.
+_GOAL_DEPTH = 0.60
+_GOAL_ESCAPE_INFIELD_M = 0.65
+_GOAL_ESCAPE_LATERAL_M = 0.55
+
 
 class MotionController:
     """Reactive motion controller that integrates avoidance, walking control, and kicking.
@@ -100,11 +108,26 @@ class MotionController:
         if robot is None or robot.pose is None:
             return RobotCommand.stop(f"{reason}: waiting for pose")
 
-        # Path detour: compute via point
-        adjusted_target = self._avoidance_target(player_id, robot.pose, target, context)
-        adjusted_reason = (
-            f"{reason} via obstacle" if adjusted_target != target else reason
-        )
+        # Never pursue a point inside the U-shaped goal.  If the robot already
+        # overlaps the frame, force a deterministic escape before normal tangent
+        # avoidance; otherwise the start-ignore dead zone can make the frame
+        # disappear exactly when it is most needed.
+        safe_target = self._project_out_of_goal(target)
+        escape_target = self._goal_escape_target(robot.pose)
+        if escape_target is not None:
+            self._avoid_side_by_player.pop(player_id, None)
+            adjusted_target = escape_target
+            adjusted_reason = f"{reason} escape goal frame"
+        else:
+            adjusted_target = self._avoidance_target(
+                player_id, robot.pose, safe_target, context
+            )
+            if adjusted_target != safe_target:
+                adjusted_reason = f"{reason} via obstacle"
+            elif safe_target != target:
+                adjusted_reason = f"{reason} goal-safe target"
+            else:
+                adjusted_reason = reason
 
         # Walking control: compute vx + vyaw
         arrive_dist = _ARRIVE_DISTANCE if arrive_distance is None else arrive_distance
@@ -165,6 +188,69 @@ class MotionController:
         )
 
     # Path detour
+
+    def _project_out_of_goal(self, target: Pose2D) -> Pose2D:
+        """Project targets in either goal enclosure back onto the playable field.
+
+        Targets outside the goal mouth are left alone: they may be intermediate
+        recovery points around the outside of a side net.  Only the U-shaped
+        enclosure and its immediate frame clearance are rejected.
+        """
+        half_length = self._config.field_length / 2.0
+        half_goal_width = self._config.goal_width / 2.0
+        abs_x = abs(target.x)
+        if not (
+            half_length <= abs_x <= half_length + _GOAL_DEPTH + 0.30
+            and abs(target.y)
+            <= half_goal_width + 0.30 + self._config.strategy.obstacle_safety_margin
+        ):
+            return target
+
+        sign_x = 1.0 if target.x >= 0.0 else -1.0
+        inner_y = max(0.0, half_goal_width - _GOAL_ESCAPE_LATERAL_M)
+        return Pose2D(
+            x=sign_x * (half_length - _GOAL_ESCAPE_INFIELD_M),
+            y=clamp(target.y, -inner_y, inner_y),
+            theta=target.theta,
+        )
+
+    def _goal_escape_target(self, start: Pose2D) -> Pose2D | None:
+        """Return a forced escape point when ``start`` overlaps the goal frame.
+
+        Inside the mouth, escape diagonally inward and toward its centre.  From
+        outside a side net, move inward and farther outside so the route goes
+        around the post instead of cutting through the net.
+        """
+        margin = self._config.strategy.obstacle_safety_margin
+        goal_obstacles = self._obstacles.goal_structure_obstacles()
+        if not any(
+            math.hypot(start.x - obstacle.x, start.y - obstacle.y)
+            < obstacle.radius + margin
+            for obstacle in goal_obstacles
+        ):
+            return None
+
+        half_length = self._config.field_length / 2.0
+        half_width = self._config.field_width / 2.0
+        half_goal_width = self._config.goal_width / 2.0
+        sign_x = 1.0 if start.x >= 0.0 else -1.0
+        sign_y = 1.0 if start.y >= 0.0 else -1.0
+        escape_x = sign_x * (half_length - _GOAL_ESCAPE_INFIELD_M)
+
+        if abs(start.y) <= half_goal_width:
+            inner_y = max(0.0, half_goal_width - _GOAL_ESCAPE_LATERAL_M)
+            escape_y = clamp(start.y, -inner_y, inner_y)
+        else:
+            escape_y = sign_y * min(
+                half_width - 0.25,
+                half_goal_width + _GOAL_ESCAPE_LATERAL_M,
+            )
+
+        return Pose2D(
+            x=escape_x,
+            y=escape_y,
+            theta=math.atan2(escape_y - start.y, escape_x - start.x),
+        )
 
     def _avoidance_target(
         self,
