@@ -1,0 +1,11 @@
+id = "com.example.mamba"
+version = "2.2.0"
+name = { en = "Mamba 3v3", zh = "Mamba 3v3 足球" }
+logo = "/res/logo.png"
+description = "Rule-compliant 3v3 soccer Agent based on the official SoccerSim template"
+entry = "src/main.py:SoccerSimAgent"
+debuggable = true
+
+[requirements]
+min_api_level = 10700
+models = [ "Booster T1", "Booster K1" ]
