@@ -9,8 +9,9 @@ The biped base is most stable with ``vx + vyaw`` commands. Lateral ``vy`` is
 left at zero in combined movement commands, so avoidance is split into path
 detours that change the target and yaw avoidance that changes angular velocity.
 
-PLAY and READY share walking parameters. The remaining phase difference is the
-``avoid_opponents`` flag: off for PLAY, on for READY and recovery paths.
+PLAY, READY, and recovery share the same nearby-robot avoidance.  Opponents must
+remain enabled during PLAY as well; disabling them creates a collision blind spot
+when the path layer ignores an obstacle already close to the robot.
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ _MAX_ALIGN_TIME = 2.0  # Maximum time spent aligning before forcing arrival
 _GOAL_DEPTH = 0.60
 _GOAL_ESCAPE_INFIELD_M = 0.65
 _GOAL_ESCAPE_LATERAL_M = 0.55
+_GOAL_ESCAPE_SPEED_MPS = 0.40
 
 
 class MotionController:
@@ -84,6 +86,7 @@ class MotionController:
         self._kicker = kicker
         self._obstacles = obstacles
         self._avoid_side_by_player: dict[int, float] = {}
+        self._goal_escape_plan_by_player: dict[int, tuple[str, Pose2D]] = {}
 
     # Public interface
 
@@ -95,25 +98,23 @@ class MotionController:
         reason: str,
         arrive_distance: float | None = None,
         hold_vyaw: float = 0.0,
-        avoid_opponents: bool = False,
     ) -> RobotCommand:
         """Generate a movement command with avoidance applied.
 
         ``arrive_distance`` overrides the arrival threshold; ``hold_vyaw`` keeps a
-        nonzero turn rate after arrival; ``avoid_opponents`` includes opponents in
-        yaw avoidance. PLAY passes False so chasers are not pushed away from opponents,
-        while READY/recovery/opponent restarts pass True.
+        nonzero turn rate after arrival. Nearby teammates and opponents are always
+        included in yaw avoidance in every moving phase.
         """
         robot = context.teammates.get(player_id)
         if robot is None or robot.pose is None:
             return RobotCommand.stop(f"{reason}: waiting for pose")
 
-        # Never pursue a point inside the U-shaped goal.  If the robot already
-        # overlaps the frame, force a deterministic escape before normal tangent
-        # avoidance; otherwise the start-ignore dead zone can make the frame
-        # disappear exactly when it is most needed.
+        # Never pursue a point inside the U-shaped goal.  If the robot overlaps
+        # the frame or is outside the goal line, run topology-safe recovery before
+        # normal tangent avoidance.  In particular, a robot behind the back net
+        # must go around a rear corner rather than drive straight toward the ball.
         safe_target = self._project_out_of_goal(target)
-        escape_target = self._goal_escape_target(robot.pose)
+        escape_target = self._goal_escape_target(player_id, robot.pose, context)
         if escape_target is not None:
             self._avoid_side_by_player.pop(player_id, None)
             adjusted_target = escape_target
@@ -131,20 +132,27 @@ class MotionController:
 
         # Walking control: compute vx + vyaw
         arrive_dist = _ARRIVE_DISTANCE if arrive_distance is None else arrive_distance
-        command = self._compute_velocity(
-            robot.pose,
-            adjusted_target,
-            adjusted_reason,
-            arrive_dist,
-            hold_vyaw,
-        )
+        if escape_target is not None:
+            # Translating immediately is essential when another robot pins us
+            # against the frame: an in-place turn cannot break contact.  Reverse
+            # is allowed so a robot facing the net can still move infield now.
+            command = self._compute_goal_escape_velocity(
+                robot.pose, adjusted_target, adjusted_reason
+            )
+        else:
+            command = self._compute_velocity(
+                robot.pose,
+                adjusted_target,
+                adjusted_reason,
+                arrive_dist,
+                hold_vyaw,
+            )
 
         # Yaw avoidance: add vyaw bias
         return self._apply_yaw_avoidance(
             player_id,
             context,
             command,
-            avoid_opponents,
         )
 
     def kick_command(
@@ -200,7 +208,7 @@ class MotionController:
         half_goal_width = self._config.goal_width / 2.0
         abs_x = abs(target.x)
         if not (
-            half_length <= abs_x <= half_length + _GOAL_DEPTH + 0.30
+            half_length <= abs_x
             and abs(target.y)
             <= half_goal_width + 0.30 + self._config.strategy.obstacle_safety_margin
         ):
@@ -214,43 +222,170 @@ class MotionController:
             theta=target.theta,
         )
 
-    def _goal_escape_target(self, start: Pose2D) -> Pose2D | None:
-        """Return a forced escape point when ``start`` overlaps the goal frame.
+    def _goal_escape_target(
+        self,
+        player_id: int,
+        start: Pose2D,
+        context: PlayContext,
+    ) -> Pose2D | None:
+        """Return a topology-safe recovery point around the goal frame.
 
-        Inside the mouth, escape diagonally inward and toward its centre.  From
-        outside a side net, move inward and farther outside so the route goes
-        around the post instead of cutting through the net.
+        Several infield/centre/outside candidates are scored against nearby
+        teammates and opponents.  This matters when two robots and a post form a
+        three-body pinch.  A robot behind the back net first moves around a rear
+        corner, then returns infield outside the side net; it must never target a
+        ball through the net wall.
         """
         margin = self._config.strategy.obstacle_safety_margin
         goal_obstacles = self._obstacles.goal_structure_obstacles()
-        if not any(
+        frame_overlap = any(
             math.hypot(start.x - obstacle.x, start.y - obstacle.y)
             < obstacle.radius + margin
             for obstacle in goal_obstacles
-        ):
-            return None
+        )
 
         half_length = self._config.field_length / 2.0
         half_width = self._config.field_width / 2.0
         half_goal_width = self._config.goal_width / 2.0
+        abs_x = abs(start.x)
+        if not frame_overlap and abs_x <= half_length:
+            self._goal_escape_plan_by_player.pop(player_id, None)
+            return None
+
         sign_x = 1.0 if start.x >= 0.0 else -1.0
         sign_y = 1.0 if start.y >= 0.0 else -1.0
         escape_x = sign_x * (half_length - _GOAL_ESCAPE_INFIELD_M)
+        near_line_x = sign_x * (half_length - 0.20)
+        inner_y = max(0.0, half_goal_width - _GOAL_ESCAPE_LATERAL_M)
+        frame_clearance = 0.30 + margin
+        outer_y = min(
+            half_width - 0.25,
+            half_goal_width
+            + max(_GOAL_ESCAPE_LATERAL_M, frame_clearance + 0.15),
+        )
+        back_x = half_length + _GOAL_DEPTH
+        rear_route_x = sign_x * (back_x + frame_clearance + 0.20)
 
-        if abs(start.y) <= half_goal_width:
-            inner_y = max(0.0, half_goal_width - _GOAL_ESCAPE_LATERAL_M)
-            escape_y = clamp(start.y, -inner_y, inner_y)
+        if abs_x >= back_x and abs(start.y) < outer_y:
+            # Behind the back net: stay behind it while moving around either
+            # rear corner.  Any infield target from here crosses solid netting.
+            escape_phase = "behind_net"
+            candidates = (
+                (rear_route_x, sign_y * outer_y),
+                (rear_route_x, -sign_y * outer_y),
+            )
+        elif abs_x > half_length and abs(start.y) >= half_goal_width:
+            # We have cleared a side of the U.  Now return infield while keeping
+            # enough lateral clearance from the side net and front post.
+            escape_phase = "around_side"
+            route_sign_y = 1.0 if start.y >= 0.0 else -1.0
+            candidates = (
+                (escape_x, route_sign_y * outer_y),
+                (near_line_x, route_sign_y * outer_y),
+            )
+        elif abs(start.y) <= half_goal_width:
+            escape_phase = "mouth"
+            candidates = (
+                (escape_x, clamp(start.y, -inner_y, inner_y)),
+                (escape_x, start.y),
+                (escape_x, -sign_y * inner_y),
+                (near_line_x, sign_y * outer_y),
+                (near_line_x, -sign_y * outer_y),
+            )
         else:
-            escape_y = sign_y * min(
-                half_width - 0.25,
-                half_goal_width + _GOAL_ESCAPE_LATERAL_M,
+            escape_phase = "side_contact"
+            candidates = (
+                (escape_x, sign_y * outer_y),
+                (escape_x, clamp(start.y, -half_width + 0.25, half_width - 0.25)),
+                (near_line_x, sign_y * outer_y),
+                (escape_x, sign_y * inner_y),
             )
 
-        return Pose2D(
+        dynamic_obstacles = (
+            self._obstacles.opponent_obstacles(context)
+            + self._obstacles.teammate_obstacles(player_id, context)
+        )
+        scored_candidates = tuple(
+            (
+                self._goal_escape_candidate_score(
+                    start, candidate[0], candidate[1], dynamic_obstacles
+                ),
+                candidate,
+            )
+            for candidate in candidates
+        )
+        best_score, (escape_x, escape_y) = max(
+            scored_candidates,
+            key=lambda item: item[0],
+        )
+
+        # Keep the previous route through small perception changes.  Without
+        # this hysteresis, two nearly equal openings can make the target flip
+        # every tick and turn a valid escape into another stationary oscillation.
+        previous_plan = self._goal_escape_plan_by_player.get(player_id)
+        if previous_plan is not None and previous_plan[0] == escape_phase:
+            previous = previous_plan[1]
+            previous_score = self._goal_escape_candidate_score(
+                start, previous.x, previous.y, dynamic_obstacles
+            )
+            if previous_score >= best_score - 0.75:
+                escape_x, escape_y = previous.x, previous.y
+
+        escape = Pose2D(
             x=escape_x,
             y=escape_y,
             theta=math.atan2(escape_y - start.y, escape_x - start.x),
         )
+        self._goal_escape_plan_by_player[player_id] = (escape_phase, escape)
+        return escape
+
+    def _goal_escape_candidate_score(
+        self,
+        start: Pose2D,
+        target_x: float,
+        target_y: float,
+        dynamic_obstacles: tuple[Obstacle, ...],
+    ) -> float:
+        """Prefer escape segments that immediately open space from nearby robots."""
+        dx = target_x - start.x
+        dy = target_y - start.y
+        length = math.hypot(dx, dy)
+        if length <= 1e-6:
+            return -math.inf
+        dir_x = dx / length
+        dir_y = dy / length
+        margin = self._config.strategy.obstacle_safety_margin
+        score = 0.0
+
+        for obstacle in dynamic_obstacles:
+            rel_away_x = start.x - obstacle.x
+            rel_away_y = start.y - obstacle.y
+            start_distance = math.hypot(rel_away_x, rel_away_y)
+            influence = obstacle.radius + margin + 0.80
+            if start_distance >= influence:
+                continue
+
+            end_distance = math.hypot(target_x - obstacle.x, target_y - obstacle.y)
+            separation_gain = end_distance - start_distance
+            away_alignment = (
+                rel_away_x * dir_x + rel_away_y * dir_y
+            ) / max(start_distance, 0.05)
+
+            # Ignore the unavoidable overlap at t=0 and inspect whether the
+            # first steps actually leave the neighbor instead of crossing it.
+            sampled_clearance = min(
+                math.hypot(
+                    start.x + dx * fraction - obstacle.x,
+                    start.y + dy * fraction - obstacle.y,
+                )
+                - obstacle.radius
+                - margin
+                for fraction in (0.25, 0.50, 0.75, 1.0)
+            )
+            score += 5.0 * separation_gain + 2.0 * away_alignment
+            score += 2.0 * clamp(sampled_clearance, -1.0, 1.0)
+
+        return score
 
     def _avoidance_target(
         self,
@@ -374,6 +509,40 @@ class MotionController:
 
     # Walking control
 
+    def _compute_goal_escape_velocity(
+        self,
+        pose: Pose2D,
+        target: Pose2D,
+        reason: str,
+    ) -> RobotCommand:
+        """Translate immediately toward an escape target, forward or backward.
+
+        Normal navigation turns in place for large heading errors.  That is safe
+        in open play but ineffective in a goal-frame pinch, where rotation alone
+        cannot create clearance from either contact body.
+        """
+        angle_to_target = math.atan2(target.y - pose.y, target.x - pose.x)
+        forward_error = normalize_angle(angle_to_target - pose.theta)
+        if abs(forward_error) <= math.pi / 2.0:
+            drive_sign = 1.0
+            steering_error = forward_error
+        else:
+            drive_sign = -1.0
+            steering_error = normalize_angle(forward_error - math.pi)
+
+        speed = min(
+            _GOAL_ESCAPE_SPEED_MPS,
+            self._config.strategy.max_linear_speed,
+        )
+        return RobotCommand(
+            intent=MoveIntent(
+                vx=drive_sign * speed,
+                vy=0.0,
+                vyaw=self._angular_velocity(steering_error),
+            ),
+            reason=reason,
+        )
+
     def _compute_velocity(
         self,
         pose: Pose2D,
@@ -470,15 +639,15 @@ class MotionController:
         player_id: int,
         context: PlayContext,
         command: RobotCommand,
-        include_opponents: bool,
     ) -> RobotCommand:
         """Map nearby-neighbor threats to a vyaw bias added onto the command.
 
         A biped cannot add field-frame lateral velocity like an omni robot; instead
         it turns a bit more and walks along the new direction around the neighbor.
 
-        ``include_opponents`` controls whether opponents count as neighbors: True
-        in READY/recovery, False in PLAY to avoid pushing chasers away from opponents.
+        Both teammates and opponents count as neighbors.  Excluding opponents in
+        PLAY leaves no avoidance layer when one is already inside the path
+        planner's start-ignore distance.
         """
         intent = command.intent
         # Apply bias only to forward MoveIntent commands; kick, pure turn, pure strafe, and stop are unchanged.
@@ -522,14 +691,13 @@ class MotionController:
                 teammate.pose.y - robot.pose.y,
             )
 
-        if include_opponents:
-            for opponent in context.opponents.values():
-                if opponent.pose is None:
-                    continue
-                yaw_bias += neighbor_yaw_contribution(
-                    opponent.pose.x - robot.pose.x,
-                    opponent.pose.y - robot.pose.y,
-                )
+        for opponent in context.opponents.values():
+            if opponent.pose is None:
+                continue
+            yaw_bias += neighbor_yaw_contribution(
+                opponent.pose.x - robot.pose.x,
+                opponent.pose.y - robot.pose.y,
+            )
 
         if abs(yaw_bias) < 1e-6:
             return command

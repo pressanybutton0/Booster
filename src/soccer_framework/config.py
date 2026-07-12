@@ -110,7 +110,9 @@ class SoccerStrategyTuning:
     # For the biped base, the stable set_velocity combination is vx + vyaw; vy lateral
     # movement comes from gait synthesis, so this layer changes only vyaw and never vy.
     # Teammates always count as neighbors; opponents are included by BT phase through move_to.
-    # PLAY excludes opponents so chasers are not pushed away; READY/recovery includes them.
+    # PLAY, READY, and recovery all include opponents.  Disabling close-opponent
+    # avoidance creates a blind spot when another robot is already inside the
+    # path planner's start-ignore distance.
     yaw_avoid_horizon_sec: float = 1.0  #  Prediction horizon for nearby-neighbor trajectories.
     yaw_avoid_min_distance_m: float = 0.78  #  Apply bias only when current or predicted distance is below this value.
     yaw_avoid_bias_max: float = (

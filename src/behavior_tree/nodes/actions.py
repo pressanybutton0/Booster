@@ -142,7 +142,6 @@ class GoReadyTarget(_ActionLeaf):
         slot = self._kit.config.ready_slot_for_player(self._player_id)
         return self._kit.motion.move_to_target(
             self._player_id, context, target, f"ready {slot.value}",
-            avoid_opponents=True,
         )
 
 
@@ -200,7 +199,6 @@ class AvoidOpponentRestart(_ActionLeaf):
             "avoid opponent restart",
             arrive_distance=0.25,
             hold_vyaw=self._kit.targeting.opponent_restart_hold_vyaw(self._player_id, game),
-            avoid_opponents=True,
         )
 
 
