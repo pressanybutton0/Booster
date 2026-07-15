@@ -210,6 +210,19 @@ class SoccerConfig:
                 return player_id
         return None
 
+    def kickoff_player_id(self) -> int:
+        """Return the single designated kickoff player.
+
+        CENTER is the normal kicker.  Falling back to the first configured
+        player keeps custom team sizes deterministic instead of allowing every
+        role to approach the ball during the restricted kickoff window.
+        """
+
+        for player_id in self.player_ids:
+            if self.ready_slot_for_player(player_id) == ReadySlot.CENTER:
+                return player_id
+        return self.player_ids[0]
+
     def opponent_team_id(self) -> int:
         return 2 if self.team_id == 1 else 1
 

@@ -175,6 +175,7 @@ def _create_player_safety_subtree(
                     IsNotWalkMode(player_id),
                     IsWalkModeRequired(player_id),
                     TriggerEnterWalkMode(kit, player_id),
+                    StopPlayer(kit, player_id, "waiting for walk mode"),
                 ],
             ),
             py_trees.behaviours.Success(name=f"WalkModeOk({player_id})"),

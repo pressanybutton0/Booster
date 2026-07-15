@@ -7,6 +7,7 @@ Global safety: IsGlobalSafetyActive
 IsPlayerAllowed / IsPlayerDisallowed / Player eligibility: IsAllPlayersInactive / IsPlayerAllowed / IsPlayerDisallowed
 Ball state: IsBallKnown
 IsOpponentKickoffActive / Rules: IsOpponentRestartActive / IsOpponentKickoffActive
+IsOwnKickoffSupporterActive / own-kickoff single-kicker discipline
 Kicking: IsInKickRange
 IsNotWalkMode / IsWalkModeRequired / For SafetyOverrides: IsRobotFallen / IsNotWalkMode / IsWalkModeRequired
 """
@@ -240,16 +241,34 @@ class IsOpponentKickoffActive(_ReadOnlyLeaf):
         game = self._read_game()
         if game is None:
             return py_trees.common.Status.FAILURE
-        kickoff_active = (
-            game.state == GameState.PLAYING
-            and game.set_play == SetPlay.NONE
-            and game.secondary_time > 0
-            and game.has_kicking_team()
-            and game.kicking_team != self._kit.config.team_id
+        kickoff_active = game.is_kickoff_active_for_team(
+            self._kit.config.opponent_team_id()
         )
         return (
             py_trees.common.Status.SUCCESS
             if kickoff_active
+            else py_trees.common.Status.FAILURE
+        )
+
+
+class IsOwnKickoffSupporterActive(_ReadOnlyLeaf):
+    """Hold every non-kicker while our kickoff restriction is active."""
+
+    def __init__(self, kit: "SoccerKit", player_id: int):
+        super().__init__(f"IsOwnKickoffSupporterActive({player_id})")
+        self._kit = kit
+        self._player_id = player_id
+
+    def update(self) -> py_trees.common.Status:
+        game = self._read_game()
+        active = (
+            game is not None
+            and game.is_kickoff_active_for_team(self._kit.config.team_id)
+            and self._player_id != self._kit.config.kickoff_player_id()
+        )
+        return (
+            py_trees.common.Status.SUCCESS
+            if active
             else py_trees.common.Status.FAILURE
         )
 

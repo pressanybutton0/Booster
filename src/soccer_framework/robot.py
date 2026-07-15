@@ -39,12 +39,6 @@ class _RobotCloser(Protocol):
     def __call__(self) -> None: ...
 
 
-def _stop_or_noop_for_mode(mode: str | None, reason: str) -> RobotCommand:
-    if mode is not None and mode != "walk":
-        return RobotCommand.noop(reason)
-    return RobotCommand.stop(reason)
-
-
 class RobotClient:
     """Control client for one robot: hardware access plus all stateful per-robot logic.
 
@@ -55,7 +49,7 @@ class RobotClient:
     Status polling**: ``poll_status`` reads SDK mode each tick; fall_down is
     read only outside walk mode, and ``ensure_walk_mode`` is confirmed by the next tick.
     Safety actions**: ``trigger_get_up`` is retry-throttled, and
-    ``ensure_walk_mode`` optimistically updates cache to avoid repeated same-tick triggers.
+    ``ensure_walk_mode`` throttles transition requests and waits for a polled confirmation.
     Command execution**: ``apply`` routes :class:`RobotCommand`; kick intents
     own the chassis, move commands wait for kick release, stop forces release and
     zero velocity, and no-op leaves hardware untouched.
@@ -67,6 +61,7 @@ class RobotClient:
     """
 
     _GET_UP_RETRY_INTERVAL_SEC = 1.0
+    _WALK_MODE_RETRY_INTERVAL_SEC = 1.0
 
     def __init__(
         self,
@@ -91,6 +86,7 @@ class RobotClient:
 
         # Get-up retry throttle
         self._last_get_up_at = 0.0
+        self._last_walk_mode_attempt_at = 0.0
 
         # Kick state machine
         self._kick_enabled = False
@@ -141,8 +137,8 @@ class RobotClient:
         kick release and zero velocity, then close hardware. Callers need not pre-stop.
         """
 
-        status = self.poll_status(time.monotonic())
-        self.apply(_stop_or_noop_for_mode(status.mode, "runtime closing"))
+        self.poll_status(time.monotonic())
+        self.apply(RobotCommand.stop("runtime closing"))
         try:
             self._close_hardware()
         except Exception as exc:
@@ -227,7 +223,12 @@ class RobotClient:
         return True
 
     def ensure_walk_mode(self, reason: str) -> None:
-        """Switch to walk gait and walk mode; the next tick polls mode again to confirm."""
+        """Request walk gait/mode and hold movement until polling confirms it."""
+
+        now = time.monotonic()
+        if now - self._last_walk_mode_attempt_at < self._WALK_MODE_RETRY_INTERVAL_SEC:
+            return
+        self._last_walk_mode_attempt_at = now
 
         previous = self._cached_status
         self._logger.info(
@@ -240,14 +241,11 @@ class RobotClient:
             mode=previous.mode,
             reason=reason,
         )
+        # A successful RPC only acknowledges the requested transition; the
+        # robot may still reject velocity for several control ticks.  Keep the
+        # observed non-walk cache unchanged so SafetyOverrides continues to
+        # replace movement with stop until poll_status actually reports walk.
         self._enter_soccer_mode(reason)
-        # Optimistically update cache to avoid repeated triggers this tick; the next poll confirms.
-        self._cached_status = RobotRuntimeStatus(
-            mode="walk",
-            fall_down_state=previous.fall_down_state,
-            fall_down_recoverable=previous.fall_down_recoverable,
-            updated_at=time.monotonic(),
-        )
 
     # Command execution
 
@@ -287,7 +285,8 @@ class RobotClient:
         """
 
         self._release_kick(force=True, reason=reason)
-        self._dispatch_velocity(MoveIntent(), reason)
+        if self._cached_status.mode in {None, "walk"}:
+            self._dispatch_velocity(MoveIntent(), reason)
 
     def _apply_move(self, intent: MoveIntent, reason: str) -> None:
         """Move command: release kick with ``min_active`` debounce before sending velocity.
@@ -466,7 +465,7 @@ class RobotClient:
 
     # Private mode switching
 
-    def _enter_soccer_mode(self, reason: str) -> None:
+    def _enter_soccer_mode(self, reason: str) -> bool:
         try:
             self._set_gait("soccer")
             self._set_mode("walk")
@@ -482,6 +481,8 @@ class RobotClient:
                 error_type=exc.__class__.__name__,
                 error=str(exc),
             )
+            return False
+        return True
 
     def _dispatch_velocity(
         self,
@@ -561,8 +562,8 @@ class TeamRobotManager:
 
         now = time.monotonic()
         for client in self._clients.values():
-            status = client.poll_status(now)
-            client.apply(_stop_or_noop_for_mode(status.mode, reason))
+            client.poll_status(now)
+            client.apply(RobotCommand.stop(reason))
 
     # Routing and queries
 

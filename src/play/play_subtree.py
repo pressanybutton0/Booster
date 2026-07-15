@@ -43,6 +43,7 @@ from ..behavior_tree.nodes.conditions import (
     IsGameInState,
     IsOpponentKickoffActive,
     IsOpponentRestartActive,
+    IsOwnKickoffSupporterActive,
 )
 from .nodes import AssignRoles, IsRole, WaitForBall
 from .playbook import Playbook
@@ -62,6 +63,16 @@ def _create_role_subtree(
     """
 
     branches: list[py_trees.behaviour.Behaviour] = []
+
+    own_kickoff_hold = py_trees.composites.Sequence(
+        name=f"OwnKickoffHold({player_id})",
+        memory=False,
+        children=[
+            IsOwnKickoffSupporterActive(kit, player_id),
+            GoReadyTarget(kit, player_id),
+        ],
+    )
+    branches.append(own_kickoff_hold)
 
     kickoff_hold = py_trees.composites.Sequence(
         name=f"KickoffHold({player_id})",

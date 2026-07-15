@@ -266,6 +266,24 @@ class GameControlState:
     def is_kickoff_for_team(self, team_id: int) -> bool:
         return self.set_play == SetPlay.NONE and self.kicking_team == team_id
 
+    def is_kickoff_active_for_team(self, team_id: int) -> bool:
+        """Whether the initial-touch restriction is still active for ``team_id``.
+
+        GameController keeps ``set_play`` at ``NONE`` for kickoffs and uses
+        ``secondary_time`` until possession is opened to both teams.  Keeping
+        this predicate on the state object gives every strategy layer the same
+        interpretation of that short restricted window.
+        """
+
+        return (
+            self.state == GameState.PLAYING
+            and not self.stopped
+            and self.set_play == SetPlay.NONE
+            and self.secondary_time > 0
+            and self.has_kicking_team()
+            and self.kicking_team == team_id
+        )
+
     def is_restart_for_team(self, team_id: int) -> bool:
         return self.has_kicking_team() and self.kicking_team == team_id
 

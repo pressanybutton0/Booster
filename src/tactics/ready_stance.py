@@ -7,6 +7,8 @@ held by :class:`SoccerKit`.
 
 from __future__ import annotations
 
+import math
+
 from ..soccer_framework import (
     BallState,
     GameControlState,
@@ -85,10 +87,64 @@ class ReadyStance:
         own_restart = game.is_restart_for_team(self.config.team_id)
         base_target = self.base_ready_target(slot, own_restart)
         if game.set_play == SetPlay.NONE or ball is None:
-            return base_target
-        if own_restart:
-            return self._own_set_play_ready_target(slot, ball, base_target)
-        return self.field.avoid_ball_target(base_target, ball)
+            target = base_target
+        elif own_restart:
+            target = self._own_set_play_ready_target(slot, ball, base_target)
+        else:
+            target = self.field.avoid_ball_target(base_target, ball)
+        return self._legalize_ready_target(target, game, ball)
+
+    def _legalize_ready_target(
+        self,
+        target: Pose2D,
+        game: GameControlState,
+        ball: BallState | None,
+    ) -> Pose2D:
+        """Apply kickoff placement constraints after all set-play rewrites.
+
+        A kickoff READY target must remain safely inside our half.  During an
+        opponent kickoff it must also stay outside the centre circle.  The
+        margins prevent small localisation/arrival oscillations from turning a
+        nominally legal target into an illegal measured pose.
+        """
+
+        target = self.field.clamp_inside_field(target, margin=0.45)
+        if game.set_play != SetPlay.NONE:
+            return target
+
+        target = Pose2D(
+            x=self.field.own_half_x(target.x, margin=0.35),
+            y=target.y,
+            theta=target.theta,
+        )
+        opponent_kickoff = (
+            game.has_kicking_team()
+            and game.kicking_team != self.config.team_id
+        )
+        if not opponent_kickoff:
+            return target
+
+        # The restricted circle is fixed at the field origin; do not move the
+        # legal boundary with a noisy perceived ball position.
+        centre_x = 0.0
+        centre_y = 0.0
+        min_radius = self.config.center_circle_radius + 0.20
+        dx = target.x - centre_x
+        dy = target.y - centre_y
+        distance = math.hypot(dx, dy)
+        if distance >= min_radius:
+            return target
+        if distance <= 1e-6:
+            dx, dy, distance = -1.0, 0.0, 1.0
+        scale = min_radius / distance
+        return self.field.clamp_inside_field(
+            Pose2D(
+                x=self.field.own_half_x(centre_x + dx * scale, margin=0.35),
+                y=centre_y + dy * scale,
+                theta=target.theta,
+            ),
+            margin=0.45,
+        )
 
     def goalkeeper_guard_target(
         self,

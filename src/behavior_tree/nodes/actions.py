@@ -22,10 +22,9 @@ from ...soccer_framework import (
     BallState,
     GameControlState,
     RobotCommand,
-    RobotRuntimeStatus,
     PlayContext,
 )
-from ..blackboard import BlackboardKeys, BlackboardClient, cmd_key, robot_status_key
+from ..blackboard import BlackboardKeys, BlackboardClient, cmd_key
 
 if TYPE_CHECKING:
     from ...runtime import SoccerKit
@@ -66,18 +65,12 @@ class _ActionLeaf(py_trees.behaviour.Behaviour):
 # Common
 
 
-def _stop_or_noop_for_status(
-    blackboard: BlackboardClient,
-    player_id: int,
+def _stop_for_status(
     reason: str,
 ) -> RobotCommand:
-    status = blackboard.read(robot_status_key(player_id))
-    if (
-        isinstance(status, RobotRuntimeStatus)
-        and status.mode is not None
-        and status.mode != "walk"
-    ):
-        return RobotCommand.noop(reason)
+    # A stop must reach RobotClient even outside walk mode so it can release an
+    # active SoccerKickManager. RobotClient itself decides whether zero velocity
+    # is legal for the currently observed hardware mode.
     return RobotCommand.stop(reason)
 
 
@@ -90,9 +83,7 @@ class StopPlayer(_ActionLeaf):
 
     def _compute_command(self) -> RobotCommand:
         self._kit.kicker.clear_player(self._player_id)
-        return _stop_or_noop_for_status(
-            self.blackboard, self._player_id, self._reason,
-        )
+        return _stop_for_status(self._reason)
 
 
 class StopAll(py_trees.behaviour.Behaviour):
@@ -113,7 +104,7 @@ class StopAll(py_trees.behaviour.Behaviour):
         for player_id in self._kit.config.player_ids:
             self.blackboard.write(
                 cmd_key(player_id),
-                _stop_or_noop_for_status(self.blackboard, player_id, self._reason),
+                _stop_for_status(self._reason),
             )
         self.blackboard.write(BlackboardKeys.SAFETY_ACTIVE, True)
         return py_trees.common.Status.SUCCESS
@@ -142,6 +133,7 @@ class GoReadyTarget(_ActionLeaf):
         slot = self._kit.config.ready_slot_for_player(self._player_id)
         return self._kit.motion.move_to_target(
             self._player_id, context, target, f"ready {slot.value}",
+            arrive_distance=0.28,
         )
 
 
@@ -159,19 +151,11 @@ class AvoidOpponentRestart(_ActionLeaf):
             return None
         self._kit.kicker.clear_player(self._player_id)
         if ball is None:
-            return _stop_or_noop_for_status(
-                self.blackboard,
-                self._player_id,
-                "avoid opponent restart: waiting for ball",
-            )
+            return _stop_for_status("avoid opponent restart: waiting for ball")
 
         robot = context.teammates.get(self._player_id)
         if robot is None or robot.pose is None:
-            return _stop_or_noop_for_status(
-                self.blackboard,
-                self._player_id,
-                "avoid opponent restart: waiting for pose",
-            )
+            return _stop_for_status("avoid opponent restart: waiting for pose")
 
         avoid_distance = self._kit.config.strategy.opponent_restart_avoid_distance_m
         distance_to_ball = math.hypot(
@@ -179,11 +163,7 @@ class AvoidOpponentRestart(_ActionLeaf):
             robot.pose.y - ball.y,
         )
         if distance_to_ball >= avoid_distance:
-            return _stop_or_noop_for_status(
-                self.blackboard,
-                self._player_id,
-                "avoid opponent restart: clear of ball",
-            )
+            return _stop_for_status("avoid opponent restart: clear of ball")
 
         slot = self._kit.config.ready_slot_for_player(self._player_id)
         target = self._kit.targeting.opponent_restart_target(
@@ -232,9 +212,7 @@ class CommitTeamCommands(py_trees.behaviour.Behaviour):
         for player_id in self._kit.config.player_ids:
             cmd = self.blackboard.read(cmd_key(player_id))
             if cmd is None:
-                cmd = _stop_or_noop_for_status(
-                    self.blackboard, player_id, "tree produced no command",
-                )
+                cmd = _stop_for_status("tree produced no command")
             commands[player_id] = cmd
             # Clear the slot so a branch that skips writing next tick cannot read a stale command.
             self.blackboard.write(cmd_key(player_id), None)
