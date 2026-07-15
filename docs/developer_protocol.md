@@ -308,7 +308,7 @@ boosteros 官方详细接口文档：[boosteros 接口文档](https://booster.fe
 | `BoosterRobot.set_mode("walk")` | READY/PLAYING 阶段需要行走命令且当前不是 walk mode 时调用 | 切换到 walk mode。 |
 | `BoosterRobot.get_mode()` | READY/PLAYING 控制 tick 读取 SDK 快照 | 检查当前模式是否仍为 walk；裁判机可能异步切到 prepare，需要在可运动阶段发现。 |
 | `BoosterRobot.get_fall_down_state()` | READY/PLAYING 且非 walk 模式下读取 SDK 快照 | 读取跌倒状态；当前使用返回对象的 `state` 和 `recoverable` 字段。walk 模式默认视为 normal。 |
-| `BoosterRobot.get_up()` | 摔倒恢复时调用 | 触发起身；manager 内部做 1 秒重试节流。 |
+| `BoosterRobot.get_up()` | 摔倒恢复时调用 | 触发异步起身；成功后进入 6.5 秒保护窗，期间不重复触发，也不发送踢球/速度命令。RPC 若返回任务已在运行，同样进入保护窗。 |
 | `BoosterRobot.set_velocity(vx, vy, vyaw)` | 普通移动/停止命令 | 双足底盘速度接口。当前导航层主要使用 `vx` 和 `vyaw`，横移 `vy` 通常保持 `0`。 |
 | `SoccerKickManager(robot)` | 启动时为每台机器人创建 | boosteros 自动踢球管理器，和 `set_velocity` 共享底盘控制通道。 |
 | `SoccerKickManager.start()` | 进入踢球意图时调用 | 开始自动踢球控制；项目会保持最小活跃时间，避免频繁 start/stop。 |

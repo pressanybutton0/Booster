@@ -20,7 +20,7 @@ from src.tactics.motion import MotionController
 from src.tactics.navigation import ObstacleCollector
 
 
-def _controller() -> MotionController:
+def _controller(*, clock=lambda: 0.0) -> MotionController:
     config = SoccerConfig()
     field = TeamFieldFrame(config)
     return MotionController(
@@ -28,6 +28,7 @@ def _controller() -> MotionController:
         field,
         KickHysteresis(enter=0.3, exit=0.5, exit_delay=0.2),
         ObstacleCollector(config, field),
+        clock=clock,
     )
 
 
@@ -64,6 +65,16 @@ class GoalFrameRecoveryTests(unittest.TestCase):
         assert escape is not None
         self.assertLess(escape.x, pose.x)
         self.assertLess(escape.y, pose.y)
+
+    def test_robot_near_but_not_touching_post_uses_normal_planning(self) -> None:
+        controller = _controller()
+        # The post obstacle radius (0.30 m) already contains the robot body.
+        # At 0.40 m this is a safe nearby pose, not a physical overlap.
+        pose = Pose2D(6.60, 1.30, 0.0)
+
+        escape = controller._goal_escape_target(1, pose, _context(pose))
+
+        self.assertIsNone(escape)
 
     def test_robot_touching_outer_side_net_routes_around_post(self) -> None:
         controller = _controller()
@@ -145,6 +156,83 @@ class GoalFrameRecoveryTests(unittest.TestCase):
         assert isinstance(command.intent, MoveIntent)
         self.assertNotEqual(command.intent.vx, 0.0)
         self.assertIn("escape goal frame", command.reason)
+
+    def test_goal_escape_owns_steering_instead_of_generic_yaw_avoidance(self) -> None:
+        controller = _controller()
+        pose = Pose2D(6.95, 1.28, 0.0)
+        context = _context(pose, opponent_pose=Pose2D(6.62, 0.98, 0.0))
+
+        command = controller.move_to_target(
+            1, context, Pose2D(0.0, 0.0, 0.0), "return"
+        )
+        escape = controller._goal_escape_plan_by_player[1][1]
+        expected = controller._compute_goal_escape_velocity(
+            pose, escape, command.reason
+        )
+
+        self.assertEqual(command.intent, expected.intent)
+        self.assertEqual(abs(command.intent.vx), 0.55)
+
+    def test_stalled_escape_rotates_to_a_different_route(self) -> None:
+        now = [0.0]
+        controller = _controller(clock=lambda: now[0])
+        pose = Pose2D(6.95, 1.28, 0.0)
+        context = _context(pose, opponent_pose=Pose2D(6.62, 0.98, 0.0))
+
+        first = controller._goal_escape_target(1, pose, context)
+        now[0] = 2.1
+        second = controller._goal_escape_target(1, pose, context)
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(second, first)
+
+    def test_small_progress_cannot_keep_the_same_route_forever(self) -> None:
+        now = [0.0]
+        controller = _controller(clock=lambda: now[0])
+        context = _context(
+            Pose2D(6.95, 1.28, 0.0),
+            opponent_pose=Pose2D(6.62, 0.98, 0.0),
+        )
+
+        controller._goal_escape_target(
+            1, Pose2D(6.95, 1.28, 0.0), context
+        )
+        now[0] = 1.0
+        controller._goal_escape_target(
+            1, Pose2D(6.82, 1.20, 0.0), context
+        )
+        self.assertEqual(
+            controller._goal_escape_progress_by_player[1].route_index,
+            0,
+        )
+
+        now[0] = 4.1
+        controller._goal_escape_target(
+            1, Pose2D(6.68, 1.12, 0.0), context
+        )
+        self.assertEqual(
+            controller._goal_escape_progress_by_player[1].route_index,
+            1,
+        )
+
+    def test_escape_route_opens_clearance_from_touched_post(self) -> None:
+        controller = _controller()
+        pose = Pose2D(6.95, 1.28, 0.0)
+        escape = controller._goal_escape_target(
+            1,
+            pose,
+            _context(pose, opponent_pose=Pose2D(6.62, 0.98, 0.0)),
+        )
+
+        assert escape is not None
+        start_distance = math.hypot(pose.x - 7.0, pose.y - 1.3)
+        next_x = pose.x + (escape.x - pose.x) * 0.35
+        next_y = pose.y + (escape.y - pose.y) * 0.35
+        self.assertGreater(
+            math.hypot(next_x - 7.0, next_y - 1.3),
+            start_distance,
+        )
 
     def test_play_motion_avoids_close_opponent_by_default(self) -> None:
         controller = _controller()

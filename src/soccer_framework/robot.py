@@ -61,7 +61,22 @@ class RobotClient:
     """
 
     _GET_UP_RETRY_INTERVAL_SEC = 1.0
+    # A rejected get_up RPC usually means the simulator's motion service is
+    # still busy. Retrying it every control second only adds more competing
+    # requests. Back off failed starts while continuing to hold StopIntent.
+    _GET_UP_FAILURE_RETRY_BASE_SEC = 2.0
+    _GET_UP_FAILURE_RETRY_MAX_SEC = 8.0
+    # get_up() starts an asynchronous task. The SDK can report ``walk`` while
+    # that task still owns the chassis, so mode alone cannot safely release
+    # velocity commands. Most SoccerSim recoveries complete in about 5.8s, but
+    # the latest collision run still had an accepted task active after 6.5s.
+    # Keep an 8s ownership window so a second get_up cannot overlap it.
+    _GET_UP_SETTLE_INTERVAL_SEC = 8.0
     _WALK_MODE_RETRY_INTERVAL_SEC = 1.0
+    # When a walking robot falls, mode changes to damping slightly before the
+    # fall_down state becomes "fallen". Give that sensor a short window before
+    # treating damping as an ordinary mode-loss and calling set_mode(walk).
+    _UNEXPECTED_NON_WALK_GRACE_SEC = 1.75
 
     def __init__(
         self,
@@ -86,7 +101,11 @@ class RobotClient:
 
         # Get-up retry throttle
         self._last_get_up_at = 0.0
+        self._get_up_retry_after = 0.0
+        self._get_up_failure_count = 0
+        self._get_up_settle_until = 0.0
         self._last_walk_mode_attempt_at = 0.0
+        self._unexpected_non_walk_since = 0.0
 
         # Kick state machine
         self._kick_enabled = False
@@ -169,8 +188,19 @@ class RobotClient:
         if polled_mode is not None:
             mode = polled_mode
             updated = True
+            if mode == "walk":
+                self._unexpected_non_walk_since = 0.0
+            elif previous.mode == "walk":
+                self._unexpected_non_walk_since = now
 
-        if mode == "walk":
+        if now < self._get_up_settle_until:
+            # get_up() is asynchronous and get_mode() may already say walk even
+            # though the recovery task still rejects set_velocity. Preserve a
+            # non-normal state so SafetyOverrides keeps writing StopIntent.
+            fall_down_state = "getting_up"
+            fall_down_recoverable = False
+            updated = True
+        elif mode == "walk":
             fall_down_state = "normal"
             fall_down_recoverable = False
         elif mode in {"prepare", "damping"}:
@@ -193,26 +223,52 @@ class RobotClient:
     def trigger_get_up(self, now: float) -> bool:
         """Send ``get_up()`` at most once per retry interval; return whether a command was actually sent."""
 
+        if now < self._get_up_settle_until or now < self._get_up_retry_after:
+            return False
         if now - self._last_get_up_at < self._GET_UP_RETRY_INTERVAL_SEC:
             return False
         self._last_get_up_at = now
 
         state = self._cached_status.fall_down_state or "unknown"
+        # A fall can interrupt an active kick. Release that chassis owner before
+        # asking the SDK to start its asynchronous get-up task.
+        self._release_kick(force=True, reason="fall down recovery")
         try:
             self._get_up()
         except Exception as exc:
+            if "get_up" in str(exc) and "already running" in str(exc):
+                self._mark_get_up_settling(now)
+                self._logger.info(
+                    f"Get-up already running for player {self._player_id}; "
+                    "holding chassis commands",
+                    event="get_up_already_running",
+                    team_id=self._config.team_id,
+                    player_id=self._player_id,
+                    state=state,
+                )
+                return False
+            self._get_up_failure_count += 1
+            retry_delay = min(
+                self._GET_UP_FAILURE_RETRY_BASE_SEC
+                * (2 ** (self._get_up_failure_count - 1)),
+                self._GET_UP_FAILURE_RETRY_MAX_SEC,
+            )
+            self._get_up_retry_after = now + retry_delay
             self._logger.warn(
                 f"get_up failed for player {self._player_id}: "
-                f"{exc.__class__.__name__}: {exc}",
+                f"{exc.__class__.__name__}: {exc}; retry in {retry_delay:.1f}s",
                 event="get_up_failed",
                 team_id=self._config.team_id,
                 player_id=self._player_id,
                 state=state,
+                failure_count=self._get_up_failure_count,
+                retry_delay_sec=retry_delay,
                 error_type=exc.__class__.__name__,
                 error=str(exc),
             )
             return False
 
+        self._mark_get_up_settling(now)
         self._logger.info(
             f"Getting up player {self._player_id}: state={state}",
             event="get_up_started",
@@ -222,10 +278,37 @@ class RobotClient:
         )
         return True
 
+    def _mark_get_up_settling(self, now: float) -> None:
+        """Keep the chassis blocked until the asynchronous get-up task settles."""
+
+        self._get_up_failure_count = 0
+        self._get_up_retry_after = 0.0
+        self._get_up_settle_until = max(
+            self._get_up_settle_until,
+            now + self._GET_UP_SETTLE_INTERVAL_SEC,
+        )
+        previous = self._cached_status
+        self._cached_status = RobotRuntimeStatus(
+            mode=previous.mode,
+            fall_down_state="getting_up",
+            fall_down_recoverable=False,
+            updated_at=now,
+        )
+
     def ensure_walk_mode(self, reason: str) -> None:
         """Request walk gait/mode and hold movement until polling confirms it."""
 
         now = time.monotonic()
+        # Get-up owns the chassis. This local guard remains authoritative even
+        # if a stale BT command or a transient get_mode failure asks for walk.
+        if now < self._get_up_settle_until or not self._cached_status.is_fall_down_normal:
+            return
+        if (
+            self._unexpected_non_walk_since > 0.0
+            and now - self._unexpected_non_walk_since
+            < self._UNEXPECTED_NON_WALK_GRACE_SEC
+        ):
+            return
         if now - self._last_walk_mode_attempt_at < self._WALK_MODE_RETRY_INTERVAL_SEC:
             return
         self._last_walk_mode_attempt_at = now
@@ -261,6 +344,12 @@ class RobotClient:
         """
 
         intent = command.intent
+        if (
+            not self._cached_status.is_fall_down_normal
+            and not isinstance(intent, (StopIntent, NoopIntent))
+        ):
+            self._apply_stop("fall down recovery")
+            return
         if isinstance(intent, KickIntent):
             self._apply_kick(intent, reason=command.reason)
             return
@@ -285,7 +374,10 @@ class RobotClient:
         """
 
         self._release_kick(force=True, reason=reason)
-        if self._cached_status.mode in {None, "walk"}:
+        if (
+            self._cached_status.is_fall_down_normal
+            and self._cached_status.mode in {None, "walk"}
+        ):
             self._dispatch_velocity(MoveIntent(), reason)
 
     def _apply_move(self, intent: MoveIntent, reason: str) -> None:

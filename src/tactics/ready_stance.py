@@ -20,6 +20,16 @@ from ..soccer_framework import (
 from .geometry import TeamFieldFrame, clamp
 
 
+# Keep this value shared with GoReadyTarget.  Legal READY targets must reserve
+# at least this much distance because walking intentionally stops anywhere
+# inside the arrival radius.
+READY_ARRIVE_DISTANCE_M = 0.28
+_READY_RULE_CLEARANCE_M = 0.25
+_READY_TARGET_RULE_MARGIN_M = (
+    READY_ARRIVE_DISTANCE_M + _READY_RULE_CLEARANCE_M
+)
+
+
 class ReadyStance:
     """READY-stage target-position calculation.
 
@@ -113,7 +123,10 @@ class ReadyStance:
             return target
 
         target = Pose2D(
-            x=self.field.own_half_x(target.x, margin=0.35),
+            x=self.field.own_half_x(
+                target.x,
+                margin=_READY_TARGET_RULE_MARGIN_M,
+            ),
             y=target.y,
             theta=target.theta,
         )
@@ -128,7 +141,9 @@ class ReadyStance:
         # legal boundary with a noisy perceived ball position.
         centre_x = 0.0
         centre_y = 0.0
-        min_radius = self.config.center_circle_radius + 0.20
+        min_radius = (
+            self.config.center_circle_radius + _READY_TARGET_RULE_MARGIN_M
+        )
         dx = target.x - centre_x
         dy = target.y - centre_y
         distance = math.hypot(dx, dy)
@@ -139,7 +154,10 @@ class ReadyStance:
         scale = min_radius / distance
         return self.field.clamp_inside_field(
             Pose2D(
-                x=self.field.own_half_x(centre_x + dx * scale, margin=0.35),
+                x=self.field.own_half_x(
+                    centre_x + dx * scale,
+                    margin=_READY_TARGET_RULE_MARGIN_M,
+                ),
                 y=centre_y + dy * scale,
                 theta=target.theta,
             ),

@@ -24,6 +24,7 @@ from ...soccer_framework import (
     RobotCommand,
     PlayContext,
 )
+from ...tactics.ready_stance import READY_ARRIVE_DISTANCE_M
 from ..blackboard import BlackboardKeys, BlackboardClient, cmd_key
 
 if TYPE_CHECKING:
@@ -133,7 +134,7 @@ class GoReadyTarget(_ActionLeaf):
         slot = self._kit.config.ready_slot_for_player(self._player_id)
         return self._kit.motion.move_to_target(
             self._player_id, context, target, f"ready {slot.value}",
-            arrive_distance=0.28,
+            arrive_distance=READY_ARRIVE_DISTANCE_M,
         )
 
 

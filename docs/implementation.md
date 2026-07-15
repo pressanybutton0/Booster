@@ -97,7 +97,7 @@ flowchart LR
 
 | 类 | 职责 |
 | --- | --- |
-| `TeamRobotManager` | 管理 `BoosterRobot` 和对应 `SoccerKickManager`。对策略层只暴露运行状态轮询、起身/模式恢复和最终命令执行：`set_velocity`、`SoccerKickManager.start/update/stop`；soccer/walk mode 只在 READY/PLAYING 阶段需要行走命令时恢复。 |
+| `TeamRobotManager` | 管理 `BoosterRobot` 和对应 `SoccerKickManager`。对策略层只暴露运行状态轮询、起身/模式恢复和最终命令执行：`set_velocity`、`SoccerKickManager.start/update/stop`；soccer/walk mode 只在 READY/PLAYING 阶段需要行走命令时恢复。异步 `get_up()` 触发后以本地保护窗持续标记 `getting_up`，防止 SDK 提前报告 walk 时误发底盘命令。 |
 | `PlayerKickStateMachine` | 封装单个球员的踢球通道，处理 `SoccerKickManager.start/update/stop`、最小活跃时间和底盘通道释放。 |
 
 ### `src/soccer_framework/types.py`

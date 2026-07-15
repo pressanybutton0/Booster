@@ -17,6 +17,9 @@ when the path layer ignores an obstacle already close to the robot.
 from __future__ import annotations
 
 import math
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from ..soccer_framework import (
     BallState,
@@ -57,7 +60,26 @@ _MAX_ALIGN_TIME = 2.0  # Maximum time spent aligning before forcing arrival
 _GOAL_DEPTH = 0.60
 _GOAL_ESCAPE_INFIELD_M = 0.65
 _GOAL_ESCAPE_LATERAL_M = 0.55
-_GOAL_ESCAPE_SPEED_MPS = 0.40
+_GOAL_ESCAPE_SPEED_MPS = 0.55
+# Goal obstacle radii already include the robot footprint.  Escape is an
+# emergency contact recovery, so only add a small perception/contact allowance
+# here.  Reusing the normal path-planning margin (0.22 m) made ordinary keeper
+# positions roughly half a metre from the frame look like collisions.
+_GOAL_ESCAPE_TRIGGER_MARGIN_M = 0.08
+_GOAL_ESCAPE_PROGRESS_M = 0.12
+_GOAL_ESCAPE_STALL_SEC = 2.0
+_GOAL_ESCAPE_ROUTE_MAX_SEC = 4.0
+
+
+@dataclass(frozen=True)
+class _GoalEscapeProgress:
+    """Progress anchor used to rotate recovery routes after a real stall."""
+
+    phase: str
+    anchor: Pose2D
+    since: float
+    route_index: int = 0
+    route_since: float = 0.0
 
 
 class MotionController:
@@ -80,13 +102,16 @@ class MotionController:
         field: TeamFieldFrame,
         kicker: KickHysteresis,
         obstacles: ObstacleCollector,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self._config = config
         self._field = field
         self._kicker = kicker
         self._obstacles = obstacles
+        self._clock = clock
         self._avoid_side_by_player: dict[int, float] = {}
         self._goal_escape_plan_by_player: dict[int, tuple[str, Pose2D]] = {}
+        self._goal_escape_progress_by_player: dict[int, _GoalEscapeProgress] = {}
 
     # Public interface
 
@@ -118,7 +143,13 @@ class MotionController:
         if escape_target is not None:
             self._avoid_side_by_player.pop(player_id, None)
             adjusted_target = escape_target
-            adjusted_reason = f"{reason} escape goal frame"
+            progress = self._goal_escape_progress_by_player.get(player_id)
+            route_detail = (
+                f" {progress.phase} r{progress.route_index}"
+                if progress is not None
+                else ""
+            )
+            adjusted_reason = f"{reason} escape goal frame{route_detail}"
         else:
             adjusted_target = self._avoidance_target(
                 player_id, robot.pose, safe_target, context
@@ -147,6 +178,12 @@ class MotionController:
                 arrive_dist,
                 hold_vyaw,
             )
+
+        # Goal recovery already scores routes against teammates and opponents.
+        # Applying the generic yaw bias again can steer the robot back into the
+        # post/net, particularly in the two-robot pinch this path handles.
+        if escape_target is not None:
+            return command
 
         # Yaw avoidance: add vyaw bias
         return self._apply_yaw_avoidance(
@@ -236,13 +273,16 @@ class MotionController:
         corner, then returns infield outside the side net; it must never target a
         ball through the net wall.
         """
-        margin = self._config.strategy.obstacle_safety_margin
         goal_obstacles = self._obstacles.goal_structure_obstacles()
         frame_overlap = any(
             math.hypot(start.x - obstacle.x, start.y - obstacle.y)
-            < obstacle.radius + margin
+            < obstacle.radius + _GOAL_ESCAPE_TRIGGER_MARGIN_M
             for obstacle in goal_obstacles
         )
+
+        # The full planning margin is still appropriate for recovery waypoints:
+        # after contact is confirmed, leave enough room to clear the frame.
+        margin = self._config.strategy.obstacle_safety_margin
 
         half_length = self._config.field_length / 2.0
         half_width = self._config.field_width / 2.0
@@ -250,6 +290,7 @@ class MotionController:
         abs_x = abs(start.x)
         if not frame_overlap and abs_x <= half_length:
             self._goal_escape_plan_by_player.pop(player_id, None)
+            self._goal_escape_progress_by_player.pop(player_id, None)
             return None
 
         sign_x = 1.0 if start.x >= 0.0 else -1.0
@@ -308,25 +349,86 @@ class MotionController:
         scored_candidates = tuple(
             (
                 self._goal_escape_candidate_score(
-                    start, candidate[0], candidate[1], dynamic_obstacles
+                    start,
+                    candidate[0],
+                    candidate[1],
+                    dynamic_obstacles,
+                    goal_obstacles,
                 ),
                 candidate,
             )
             for candidate in candidates
         )
-        best_score, (escape_x, escape_y) = max(
+        ranked_candidates = sorted(
             scored_candidates,
             key=lambda item: item[0],
+            reverse=True,
         )
+        now = self._clock()
+        progress = self._goal_escape_progress_by_player.get(player_id)
+        stalled = False
+        if progress is None or progress.phase != escape_phase:
+            progress = _GoalEscapeProgress(
+                escape_phase,
+                start,
+                now,
+                route_since=now,
+            )
+        elif now - progress.route_since >= _GOAL_ESCAPE_ROUTE_MAX_SEC:
+            # Small back-and-forth motion can exceed the displacement threshold
+            # without getting out of the frame. Cap total time on one route so
+            # that apparent progress cannot keep r0 forever.
+            stalled = True
+            progress = _GoalEscapeProgress(
+                escape_phase,
+                start,
+                now,
+                route_index=(progress.route_index + 1) % len(ranked_candidates),
+                route_since=now,
+            )
+        elif (
+            math.hypot(start.x - progress.anchor.x, start.y - progress.anchor.y)
+            >= _GOAL_ESCAPE_PROGRESS_M
+        ):
+            progress = _GoalEscapeProgress(
+                escape_phase,
+                start,
+                now,
+                route_index=progress.route_index,
+                route_since=progress.route_since,
+            )
+        elif now - progress.since >= _GOAL_ESCAPE_STALL_SEC:
+            stalled = True
+            progress = _GoalEscapeProgress(
+                escape_phase,
+                start,
+                now,
+                route_index=(progress.route_index + 1) % len(ranked_candidates),
+                route_since=now,
+            )
+        self._goal_escape_progress_by_player[player_id] = progress
+
+        best_score, (escape_x, escape_y) = ranked_candidates[
+            progress.route_index % len(ranked_candidates)
+        ]
 
         # Keep the previous route through small perception changes.  Without
         # this hysteresis, two nearly equal openings can make the target flip
         # every tick and turn a valid escape into another stationary oscillation.
         previous_plan = self._goal_escape_plan_by_player.get(player_id)
-        if previous_plan is not None and previous_plan[0] == escape_phase:
+        if (
+            not stalled
+            and progress.route_index == 0
+            and previous_plan is not None
+            and previous_plan[0] == escape_phase
+        ):
             previous = previous_plan[1]
             previous_score = self._goal_escape_candidate_score(
-                start, previous.x, previous.y, dynamic_obstacles
+                start,
+                previous.x,
+                previous.y,
+                dynamic_obstacles,
+                goal_obstacles,
             )
             if previous_score >= best_score - 0.75:
                 escape_x, escape_y = previous.x, previous.y
@@ -345,8 +447,9 @@ class MotionController:
         target_x: float,
         target_y: float,
         dynamic_obstacles: tuple[Obstacle, ...],
+        goal_obstacles: tuple[Obstacle, ...],
     ) -> float:
-        """Prefer escape segments that immediately open space from nearby robots."""
+        """Prefer segments that open space from both robots and the touched frame."""
         dx = target_x - start.x
         dy = target_y - start.y
         length = math.hypot(dx, dy)
@@ -384,6 +487,54 @@ class MotionController:
             )
             score += 5.0 * separation_gain + 2.0 * away_alignment
             score += 2.0 * clamp(sampled_clearance, -1.0, 1.0)
+
+        # Dynamic-obstacle scoring alone can select a route that moves away from
+        # a pinning opponent but slides along the post/net.  Explicitly reward
+        # leaving the nearest touched frame element, and inspect the first part
+        # of the segment so a target on the far side of the net cannot look safe.
+        if goal_obstacles:
+            nearest_frame = min(
+                goal_obstacles,
+                key=lambda obstacle: math.hypot(
+                    start.x - obstacle.x,
+                    start.y - obstacle.y,
+                )
+                - obstacle.radius,
+            )
+            frame_start_distance = math.hypot(
+                start.x - nearest_frame.x,
+                start.y - nearest_frame.y,
+            )
+            frame_end_distance = math.hypot(
+                target_x - nearest_frame.x,
+                target_y - nearest_frame.y,
+            )
+            away_x = start.x - nearest_frame.x
+            away_y = start.y - nearest_frame.y
+            away_norm = max(frame_start_distance, 0.05)
+            away_alignment = (away_x * dir_x + away_y * dir_y) / away_norm
+            score += 8.0 * clamp(
+                frame_end_distance - frame_start_distance,
+                -0.50,
+                0.80,
+            )
+            score += 3.0 * away_alignment
+
+            followup_clearance = min(
+                math.hypot(
+                    start.x + dx * fraction - obstacle.x,
+                    start.y + dy * fraction - obstacle.y,
+                )
+                - obstacle.radius
+                - _GOAL_ESCAPE_TRIGGER_MARGIN_M
+                for fraction in (0.35, 0.65, 1.0)
+                for obstacle in goal_obstacles
+            )
+            score += 12.0 * clamp(followup_clearance, -0.50, 0.50)
+            # Once multiple candidates clear the touched frame, prefer the
+            # shortest one.  Without this term a cross-mouth route can win only
+            # because its endpoint is very far from the original post.
+            score -= 1.5 * length
 
         return score
 
