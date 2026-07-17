@@ -91,13 +91,15 @@ flowchart LR
 
 | 类 | 职责 |
 | --- | --- |
-| `GameControllerRosProvider` | 裁判状态 provider。所有 Agent 都订阅 ROS2 topic 获取裁判状态，只消费仿真发布的 `/soccer/game_controller` topic；结构与 `RosTruthProvider` 一致，由 `SoccerRosAdapter` 统一 start / stop。 |
+| `GameControllerRosProvider` | 裁判状态 provider。所有 Agent 都订阅 ROS2 topic 获取裁判状态，只消费仿真发布的 `/soccer/game_controller` topic；结构与 `RosTruthProvider` 一致，由 `SoccerRosAdapter` 统一 start / stop。连续包之间会检测球员处罚/恢复、warning/caution 与比分变化，并输出一次性归因日志。 |
+
+纯数据转换放在 `game_control_monitor.py`：它把每个包缩减为不可变的球员纪律快照和比分快照，再计算 `penalised`、`cleared`、`penalty_changed`、`discipline_changed` 与 score change。该模块不依赖 ROS，可直接用于单元测试和后续离线奖励统计。
 
 ### `src/soccer_framework/robot.py`
 
 | 类 | 职责 |
 | --- | --- |
-| `TeamRobotManager` | 管理 `BoosterRobot` 和对应 `SoccerKickManager`。对策略层只暴露运行状态轮询、起身/模式恢复和最终命令执行：`set_velocity`、`SoccerKickManager.start/update/stop`；soccer/walk mode 只在 READY/PLAYING 阶段需要行走命令时恢复。异步 `get_up()` 触发后以本地保护窗持续标记 `getting_up`，防止 SDK 提前报告 walk 时误发底盘命令。 |
+| `TeamRobotManager` | 管理 `BoosterRobot` 和对应 `SoccerKickManager`。对策略层只暴露运行状态轮询、起身/模式恢复和最终命令执行：`set_velocity`、`SoccerKickManager.start/update/stop`；soccer/walk mode 只在 READY/PLAYING 阶段需要行走命令时恢复。异步 `get_up()` 触发后以 6.5 秒本地保护窗持续标记 `getting_up`，防止 SDK 提前报告 walk 时误发底盘命令，同时给首次起身失败保留裁判 10 秒窗口内的重试机会。`SoccerKickManager.stop()` 失败时保留本地底盘所有权并限频重试，确认停止前不再错误地发送普通速度命令。 |
 | `PlayerKickStateMachine` | 封装单个球员的踢球通道，处理 `SoccerKickManager.start/update/stop`、最小活跃时间和底盘通道释放。 |
 
 ### `src/soccer_framework/types.py`
@@ -257,6 +259,8 @@ classDiagram
 - 仿真环境会自动向 `/soccer/game_controller` 发布裁判状态，Agent 只消费这个 ROS2 topic。
 
 topic 订阅回调会通过 `game_control_state_from_json()` 反序列化 payload，然后写入 provider。新鲜度判断由行为树数据层内部 watchdog 统一完成：如果裁判状态、球或机器人位姿长时间没有刷新，DataLayer 会把对应字段置为 `None`。之后 `SafetyGuards` 在入口处处理这些无效输入，例如裁判状态缺失会触发 `StopAll("no game controller state")`，`PLAYING` 缺球会触发 `StopAll("waiting for ball")`。
+
+在写入 provider 之前，`GameControllerRosProvider` 还会比较连续包中的本队球员处罚和双方比分。控制台现在会直接显示类似 `reason=PUSHING, remaining=30s` 的处罚归因，而不是只能从行为树看到笼统的 `inactive or penalized`。倒计时更新不会重复输出；处罚原因改变、解除处罚以及比分变化会分别形成结构化事件。
 
 仿真环境推荐保持默认配置：
 

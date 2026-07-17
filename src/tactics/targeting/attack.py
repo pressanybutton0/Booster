@@ -18,6 +18,7 @@ from ...soccer_framework import (
     BallState,
     GameControlState,
     Pose2D,
+    ReadySlot,
     SetPlay,
     SoccerConfig,
     PlayContext,
@@ -31,6 +32,7 @@ from .predicates import ball_near_sideline
 
 __all__ = [
     "PlayerAllowed",
+    "best_backpass_target",
     "best_pass_target",
     "dribble_target",
     "kick_reason",
@@ -86,6 +88,13 @@ def select_kick_target(
 
     if shot_lane_is_clear(config, field, obstacles, context):
         return Pose2D(field.opponent_goal_x(), 0.0, 0.0)
+
+    backpass = best_backpass_target(
+        config, field, obstacles,
+        player_id, context, is_player_allowed,
+    )
+    if backpass is not None:
+        return Pose2D(backpass.x, backpass.y, 0.0)
     return dribble_target(config, field, ball)
 
 
@@ -187,6 +196,96 @@ def best_pass_target(
     return max(candidates, key=lambda item: item[0])[1]
 
 
+def best_backpass_target(
+    config: SoccerConfig,
+    field: TeamFieldFrame,
+    obstacles: ObstacleCollector,
+    player_id: int,
+    context: PlayContext,
+    is_player_allowed: PlayerAllowed,
+) -> Pose2D | None:
+    """Select a safe relief receiver behind the ball after a blocked shot.
+
+    This is intentionally narrower than :func:`best_pass_target`: it excludes
+    the configured goalkeeper, keeps the receiver outside our penalty area,
+    limits how far possession may retreat, and rejects both blocked lanes and
+    receivers already marked by an opponent. The caller only invokes it after
+    the normal forward pass and direct-shot options have failed.
+    """
+
+    if not config.strategy.pass_enabled or not config.strategy.backpass_enabled:
+        return None
+
+    ball = context.known_ball
+    game = context.known_game
+    opponent_obstacles = obstacles.opponent_obstacles(context)
+    own_penalty_front = field.own_goal_x() + config.penalty_area_length
+    candidates: list[tuple[float, Pose2D]] = []
+
+    for teammate_id, robot in context.teammates.items():
+        if teammate_id == player_id or robot.pose is None:
+            continue
+        if config.ready_slot_for_player(teammate_id) == ReadySlot.KEEPER:
+            continue
+        if not is_player_allowed(game, teammate_id):
+            continue
+
+        retreat = ball.x - robot.pose.x
+        if not (
+            config.strategy.backpass_min_retreat_m
+            <= retreat
+            <= config.strategy.backpass_max_retreat_m
+        ):
+            continue
+        if robot.pose.x <= own_penalty_front + 0.35:
+            continue
+
+        lane_score = lane_clear_score(
+            config,
+            ball.x,
+            ball.y,
+            robot.pose.x,
+            robot.pose.y,
+            opponent_obstacles,
+        )
+        if lane_score < config.strategy.pass_min_score:
+            continue
+
+        nearest_opponent = min(
+            (
+                math.hypot(robot.pose.x - obstacle.x, robot.pose.y - obstacle.y)
+                - obstacle.radius
+                for obstacle in opponent_obstacles
+            ),
+            default=float("inf"),
+        )
+        if nearest_opponent < config.strategy.backpass_receiver_clearance_m:
+            continue
+
+        receiver_space = clamp(
+            nearest_opponent / max(1.0, config.strategy.backpass_receiver_clearance_m * 2.0),
+            0.0,
+            1.0,
+        )
+        center_score = 1.0 - clamp(
+            abs(robot.pose.y) / (config.field_width / 2.0),
+            0.0,
+            1.0,
+        )
+        retreat_cost = clamp(
+            retreat / max(1.0, config.strategy.backpass_max_retreat_m),
+            0.0,
+            1.0,
+        )
+        score = 0.60 * lane_score + 0.25 * receiver_space + 0.15 * center_score
+        score -= 0.15 * retreat_cost
+        candidates.append((score, robot.pose))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
 def shot_lane_is_clear(
     config: SoccerConfig,
     field: TeamFieldFrame,
@@ -266,6 +365,7 @@ def kick_reason(
     config: SoccerConfig,
     target: Pose2D,
     default: str = "chaser kick",
+    ball: BallState | None = None,
 ) -> str:
     """Choose the reason suffix from whether target points at the opponent goal center.
 
@@ -273,6 +373,11 @@ def kick_reason(
     ``" to target"`` so logs distinguish shooting from pass/clear targets.
     """
 
+    if (
+        ball is not None
+        and target.x <= ball.x - config.strategy.backpass_min_retreat_m
+    ):
+        return f"{default.removesuffix(' kick')} backpass"
     if abs(target.x) >= config.field_length / 2.0 - 0.2 and abs(target.y) < 0.2:
         return default
     return f"{default} to target"

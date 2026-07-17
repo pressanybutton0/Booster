@@ -159,6 +159,10 @@ class DefaultPlaybook(Playbook):
         self.register_role(DefenderRole())
         self.register_role(GoalkeeperRole())
         self.strategy_manager = AdaptiveStrategyManager(kit)
+        # Preserve the current ball claimant inside the configured tie band.
+        # Without this state, tiny pose updates can swap chaser/support roles on
+        # consecutive ticks and abort an otherwise healthy kick sequence.
+        self._last_chaser_id: int | None = None
 
     def assign_roles(self, context: PlayContext) -> RoleAssignment:
         """Assign only players that GameControl currently allows on the field.
@@ -263,19 +267,33 @@ class DefaultPlaybook(Playbook):
             )
 
         if not candidates:
+            self._last_chaser_id = None
             return None
         if not scored:
-            return min(candidates)
+            selected = min(candidates)
+            self._last_chaser_id = selected
+            return selected
 
         tie_margin = config.strategy.teammate_challenge_tie_margin_m
-        # Sort by score ascending; lower is better, and scores within tie_margin are tied.
-        # Ties choose the smallest player ID for predictable debugging.
+        # Lower is better. Keep the incumbent while it remains inside the tie
+        # margin of the best challenger; this is the actual hysteresis that
+        # prevents role handoff oscillation. Only use the player-id tie-breaker
+        # when there is no eligible incumbent to preserve.
         ranked = sorted(scored, key=lambda item: item[0])
         best_score = ranked[0][0]
+        score_by_player = {player_id: score for score, player_id in ranked}
+        if (
+            self._last_chaser_id in score_by_player
+            and score_by_player[self._last_chaser_id] <= best_score + tie_margin
+        ):
+            return self._last_chaser_id
+
         tied_ids = [
             player_id for score, player_id in ranked if score <= best_score + tie_margin
         ]
-        return min(tied_ids)
+        selected = min(tied_ids)
+        self._last_chaser_id = selected
+        return selected
 
     def _slot_can_challenge(
         self,

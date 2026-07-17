@@ -23,10 +23,12 @@ from dataclasses import dataclass
 
 from ..soccer_framework import (
     BallState,
+    GameState,
     KickIntent,
     MoveIntent,
     Pose2D,
     RobotCommand,
+    SetPlay,
     SoccerConfig,
     PlayContext,
 )
@@ -69,6 +71,12 @@ _GOAL_ESCAPE_TRIGGER_MARGIN_M = 0.08
 _GOAL_ESCAPE_PROGRESS_M = 0.12
 _GOAL_ESCAPE_STALL_SEC = 2.0
 _GOAL_ESCAPE_ROUTE_MAX_SEC = 4.0
+# A rear-corner waypoint is much farther away than a post-contact waypoint.
+# Flipping to the opposite rear corner after only four seconds makes a robot
+# behind the back net traverse left/right forever instead of clearing one side.
+# Actual no-progress still uses the two-second stall detector; this longer cap
+# only allows a robot that is genuinely translating to finish the chosen side.
+_GOAL_ESCAPE_BEHIND_NET_ROUTE_MAX_SEC = 12.0
 
 
 @dataclass(frozen=True)
@@ -346,6 +354,35 @@ class MotionController:
             self._obstacles.opponent_obstacles(context)
             + self._obstacles.teammate_obstacles(player_id, context)
         )
+        game = context.game_state
+        ball = context.ball
+        if (
+            game is not None
+            and ball is not None
+            and game.state == GameState.PLAYING
+            and not game.stopped
+            and game.set_play != SetPlay.NONE
+            and game.has_kicking_team()
+            and game.kicking_team == self._config.opponent_team_id()
+        ):
+            # Goal-frame recovery temporarily overrides the normal opponent-
+            # restart target. Without carrying the ball exclusion into this
+            # emergency planner, a robot beside/behind the net can choose the
+            # physically clearest route while remaining illegally close to the
+            # restart ball. Model the rule radius as another escape obstacle;
+            # subtract the common planner margin so zero sampled clearance is
+            # exactly the configured legal distance.
+            dynamic_obstacles += (
+                Obstacle(
+                    ball.x,
+                    ball.y,
+                    max(
+                        0.0,
+                        self._config.strategy.opponent_restart_avoid_distance_m
+                        - self._config.strategy.obstacle_safety_margin,
+                    ),
+                ),
+            )
         scored_candidates = tuple(
             (
                 self._goal_escape_candidate_score(
@@ -374,7 +411,11 @@ class MotionController:
                 now,
                 route_since=now,
             )
-        elif now - progress.route_since >= _GOAL_ESCAPE_ROUTE_MAX_SEC:
+        elif now - progress.route_since >= (
+            _GOAL_ESCAPE_BEHIND_NET_ROUTE_MAX_SEC
+            if escape_phase == "behind_net"
+            else _GOAL_ESCAPE_ROUTE_MAX_SEC
+        ):
             # Small back-and-forth motion can exceed the displacement threshold
             # without getting out of the frame. Cap total time on one route so
             # that apparent progress cannot keep r0 forever.

@@ -71,8 +71,14 @@ def _context(
     opponent_score: int = 0,
     secs_remaining: int = 600,
     ball_x: float = 0.0,
+    teammate_xy: dict[int, tuple[float, float]] | None = None,
 ) -> PlayContext:
     penalties = penalties or {}
+    teammate_xy = teammate_xy or {
+        1: (-1.0, 0.0),
+        2: (-4.0, 1.0),
+        3: (-6.0, 0.0),
+    }
     own_players = [
         PlayerState(penalty=penalties.get(player_id, Penalty.NONE))
         for player_id in range(1, 4)
@@ -89,9 +95,12 @@ def _context(
         game_state=game,
         ball=BallState(x=ball_x, y=0.0, last_seen_at=1.0),
         teammates={
-            1: RobotState(1, Pose2D(-1.0, 0.0, 0.0), 1.0),
-            2: RobotState(2, Pose2D(-4.0, 1.0, 0.0), 1.0),
-            3: RobotState(3, Pose2D(-6.0, 0.0, 0.0), 1.0),
+            player_id: RobotState(
+                player_id,
+                Pose2D(x, y, 0.0),
+                1.0,
+            )
+            for player_id, (x, y) in teammate_xy.items()
         },
     )
 
@@ -167,10 +176,79 @@ class CompetitionRuleTests(unittest.TestCase):
         self.assertEqual(assignment.role_of(2), ROLE_GOALKEEPER)
         self.assertEqual(assignment.role_of(1), ROLE_CHASER)
 
-    def test_opponent_restart_target_keeps_rule_distance(self) -> None:
+    def test_chaser_hysteresis_preserves_incumbent_until_challenger_is_clear(self) -> None:
+        playbook = DefaultPlaybook(_FakeKit(SoccerConfig()))
+
+        initial = playbook.assign_roles(
+            _context(teammate_xy={1: (-0.9, 0.0), 2: (-1.5, 0.0), 3: (-6.0, 0.0)})
+        )
+        self.assertEqual(initial.role_of(1), ROLE_CHASER)
+
+        # Player 2 is only 0.05 score units better, inside the 0.25 m fluid
+        # profile tie band, so the active kick owner must not be replaced.
+        near_tie = playbook.assign_roles(
+            _context(teammate_xy={1: (-1.0, 0.0), 2: (-0.85, 0.0), 3: (-6.0, 0.0)})
+        )
+        self.assertEqual(near_tie.role_of(1), ROLE_CHASER)
+
+        clear_winner = playbook.assign_roles(
+            _context(teammate_xy={1: (-1.0, 0.0), 2: (-0.3, 0.0), 3: (-6.0, 0.0)})
+        )
+        self.assertEqual(clear_winner.role_of(2), ROLE_CHASER)
+
+    def test_chaser_hysteresis_drops_an_ineligible_incumbent(self) -> None:
+        playbook = DefaultPlaybook(_FakeKit(SoccerConfig()))
+        playbook.assign_roles(_context())
+
+        reassigned = playbook.assign_roles(
+            _context(penalties={1: Penalty.ILLEGAL_POSITIONING})
+        )
+        self.assertEqual(reassigned.role_of(1), "none")
+        self.assertEqual(reassigned.role_of(2), ROLE_CHASER)
+
+    def test_every_opponent_restart_target_keeps_rule_distance(self) -> None:
         config = SoccerConfig()
         field = TeamFieldFrame(config)
         ball = BallState(x=1.0, y=0.0, last_seen_at=1.0)
+        for set_play in SetPlay:
+            if set_play == SetPlay.NONE:
+                continue
+            with self.subTest(set_play=set_play):
+                game = GameControlState(
+                    state=GameState.PLAYING,
+                    set_play=set_play,
+                    kicking_team=2,
+                )
+                context = PlayContext(
+                    game_state=game,
+                    ball=ball,
+                    teammates={
+                        1: RobotState(1, Pose2D(1.1, 0.0, 0.0), 1.0)
+                    },
+                )
+                target = opponent_restart_target(
+                    config,
+                    field,
+                    player_id=1,
+                    slot=ReadySlot.CENTER,
+                    context=context,
+                    base_ready_target=(
+                        lambda _slot, _kickoff: Pose2D(1.0, 0.0, 0.0)
+                    ),
+                )
+                self.assertGreaterEqual(
+                    math.hypot(target.x - ball.x, target.y - ball.y),
+                    config.strategy.opponent_restart_avoid_distance_m - 1e-9,
+                )
+        self.assertGreaterEqual(
+            config.strategy.opponent_restart_avoid_distance_m,
+            1.45,
+        )
+
+    def test_opponent_goal_kick_target_leaves_penalty_area(self) -> None:
+        config = SoccerConfig()
+        field = TeamFieldFrame(config)
+        ball = BallState(x=6.0, y=0.0, last_seen_at=1.0)
         game = GameControlState(
             state=GameState.PLAYING,
             set_play=SetPlay.GOAL_KICK,
@@ -179,23 +257,31 @@ class CompetitionRuleTests(unittest.TestCase):
         context = PlayContext(
             game_state=game,
             ball=ball,
-            teammates={1: RobotState(1, Pose2D(1.1, 0.0, 0.0), 1.0)},
+            teammates={1: RobotState(1, Pose2D(0.0, 3.5, 0.0), 1.0)},
         )
+
         target = opponent_restart_target(
             config,
             field,
             player_id=1,
             slot=ReadySlot.CENTER,
             context=context,
-            base_ready_target=lambda _slot, _kickoff: Pose2D(1.0, 0.0, 0.0),
+            base_ready_target=lambda _slot, _kickoff: Pose2D(5.5, 0.0, 0.0),
         )
+        penalty_front_x = (
+            config.field_length / 2.0
+            - config.penalty_area_length
+            - 0.55
+        )
+        inside_penalty_area = (
+            target.x >= penalty_front_x
+            and abs(target.y) <= config.penalty_area_width / 2.0 + 0.35
+        )
+
+        self.assertFalse(inside_penalty_area)
         self.assertGreaterEqual(
             math.hypot(target.x - ball.x, target.y - ball.y),
             config.strategy.opponent_restart_avoid_distance_m - 1e-9,
-        )
-        self.assertGreaterEqual(
-            config.strategy.opponent_restart_avoid_distance_m,
-            1.45,
         )
 
 

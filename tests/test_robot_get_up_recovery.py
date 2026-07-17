@@ -73,9 +73,12 @@ class _Robot:
 class _KickManager:
     def __init__(self) -> None:
         self.stop_calls = 0
+        self.stop_error: Exception | None = None
 
     def stop(self) -> None:
         self.stop_calls += 1
+        if self.stop_error is not None:
+            raise self.stop_error
 
 
 def _client() -> tuple[RobotClient, _Robot]:
@@ -96,6 +99,7 @@ def _client() -> tuple[RobotClient, _Robot]:
     client._unexpected_non_walk_since = 0.0
     client._kick_enabled = False
     client._kick_started_at = 0.0
+    client._kick_stop_retry_after = 0.0
     return client, robot
 
 
@@ -134,6 +138,19 @@ class GetUpRecoveryTests(unittest.TestCase):
         self.assertTrue(client.trigger_get_up(10.0))
         self.assertEqual(client._kick_manager.stop_calls, 1)
         self.assertEqual(robot.get_up_calls, 1)
+
+    def test_still_fallen_robot_can_retry_before_incapable_window(self) -> None:
+        client, robot = _client()
+
+        self.assertEqual(client.poll_status(10.0).fall_down_state, "fallen")
+        self.assertTrue(client.trigger_get_up(10.0))
+        self.assertEqual(robot.get_up_calls, 1)
+
+        # If the first asynchronous task did not recover the body, a second
+        # attempt starts at 6.5s instead of waiting until the 10s referee limit.
+        self.assertEqual(client.poll_status(16.5).fall_down_state, "fallen")
+        self.assertTrue(client.trigger_get_up(16.5))
+        self.assertEqual(robot.get_up_calls, 2)
 
     def test_walk_mode_recovery_is_blocked_while_fallen(self) -> None:
         client, _robot = _client()
@@ -182,7 +199,7 @@ class GetUpRecoveryTests(unittest.TestCase):
         self.assertEqual(robot.get_up_calls, 1)
 
         # SoccerSim reports walk before its asynchronous get_up task releases
-        # the chassis. The local gate must remain authoritative until 8s.
+        # the chassis. The local gate must remain authoritative until 6.5s.
         robot.mode = "walk"
         status = client.poll_status(11.0)
         self.assertEqual(status.mode, "walk")
@@ -194,9 +211,41 @@ class GetUpRecoveryTests(unittest.TestCase):
         client.apply(RobotCommand.stop("test stop"))
         self.assertEqual(robot.velocities, [])
 
-        self.assertEqual(client.poll_status(18.0).fall_down_state, "normal")
+        self.assertEqual(client.poll_status(16.5).fall_down_state, "normal")
         client.apply(RobotCommand(intent=MoveIntent(vx=0.2), reason="test move"))
         self.assertEqual(robot.velocities, [(0.2, 0.0, 0.0)])
+
+    def test_failed_kick_stop_keeps_chassis_owned_until_retry_succeeds(self) -> None:
+        client, robot = _client()
+        client._cached_status = RobotRuntimeStatus(
+            mode="walk",
+            fall_down_state="normal",
+        )
+        client._kick_enabled = True
+        client._kick_started_at = 1.0
+        kick_manager = client._kick_manager
+        assert isinstance(kick_manager, _KickManager)
+        kick_manager.stop_error = RuntimeError("API call failed, code = 400")
+
+        with patch("src.soccer_framework.robot.time.monotonic", return_value=10.0):
+            client.apply(RobotCommand.stop("enter SET"))
+
+        self.assertTrue(client._kick_enabled)
+        self.assertEqual(kick_manager.stop_calls, 1)
+        self.assertEqual(robot.velocities, [])
+
+        # The 30Hz control loop must not turn a rejected stop into an RPC storm.
+        with patch("src.soccer_framework.robot.time.monotonic", return_value=10.2):
+            client.apply(RobotCommand.stop("enter SET"))
+        self.assertEqual(kick_manager.stop_calls, 1)
+
+        kick_manager.stop_error = None
+        with patch("src.soccer_framework.robot.time.monotonic", return_value=10.5):
+            client.apply(RobotCommand.stop("enter SET"))
+
+        self.assertFalse(client._kick_enabled)
+        self.assertEqual(kick_manager.stop_calls, 2)
+        self.assertEqual(robot.velocities, [(0.0, 0.0, 0.0)])
 
 
 if __name__ == "__main__":

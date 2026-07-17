@@ -132,7 +132,7 @@ class WaitForBall(py_trees.behaviour.Behaviour):
 TargetFn = Callable[[PlayContext], Pose2D]
 WantsKickFn = Callable[[PlayContext], bool]
 ReasonFn = Callable[[], str]
-KickReasonFn = Callable[[Pose2D], str]
+KickReasonFn = Callable[[Pose2D, PlayContext], str]
 
 
 def _default_move_reason(player_id: int) -> str:
@@ -241,7 +241,7 @@ class KickAction(py_trees.behaviour.Behaviour):
         player_id = self._player_id
         now = self.blackboard.read(BlackboardKeys.NOW)
         reason = (
-            self._reason_fn(kt)
+            self._reason_fn(kt, context)
             if self._reason_fn is not None
             else _default_kick_reason(player_id)
         )

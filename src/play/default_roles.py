@@ -78,10 +78,15 @@ class ChaserRole(RoleStrategy):
         kit: "SoccerKit",
         player_id: int,
         target: Pose2D,
+        context: PlayContext,
     ) -> str:
         slot = kit.config.ready_slot_for_player(player_id)
         default = "side clear" if slot == ReadySlot.SIDE else "center kick"
-        return kit.targeting.kick_reason(target, default=default)
+        return kit.targeting.kick_reason(
+            target,
+            default=default,
+            ball=context.known_ball,
+        )
 
     def build_subtree(
         self,
@@ -99,10 +104,11 @@ class ChaserRole(RoleStrategy):
                     context,
                 ),
                 reason_fn=lambda: self._approach_reason(kit, player_id),
-                kick_reason_fn=lambda target: self._kick_reason(
+                kick_reason_fn=lambda target, context: self._kick_reason(
                     kit,
                     player_id,
                     target,
+                    context,
                 ),
             ),
         )
@@ -205,6 +211,9 @@ class GoalkeeperRole(RoleStrategy):
     # Approach alignment distance for goalkeeper challenges, tighter than the chaser, in meters.
     _APPROACH_OFFSET = 0.22
 
+    def __init__(self) -> None:
+        self._clearing = False
+
     def target(
         self,
         kit: "SoccerKit",
@@ -228,7 +237,17 @@ class GoalkeeperRole(RoleStrategy):
         kit: "SoccerKit",
         context: PlayContext,
     ) -> bool:
-        return kit.targeting.ball_in_own_defensive_area(context.known_ball)
+        ball = context.known_ball
+        extra_margin = (
+            kit.config.strategy.goalkeeper_clear_exit_margin_m
+            if self._clearing
+            else 0.0
+        )
+        self._clearing = kit.targeting.ball_in_own_defensive_area(
+            ball,
+            extra_margin_m=extra_margin,
+        )
+        return self._clearing
 
     def kick_target(
         self,
@@ -251,8 +270,13 @@ class GoalkeeperRole(RoleStrategy):
         self,
         kit: "SoccerKit",
         target: Pose2D,
+        context: PlayContext,
     ) -> str:
-        return kit.targeting.kick_reason(target, default="goalkeeper clear")
+        return kit.targeting.kick_reason(
+            target,
+            default="goalkeeper clear",
+            ball=context.known_ball,
+        )
 
     def build_subtree(
         self,
@@ -267,7 +291,11 @@ class GoalkeeperRole(RoleStrategy):
                 kick_target_fn=lambda context: self.kick_target(kit, context),
                 wants_kick_fn=lambda context: self.wants_to_kick(kit, context),
                 reason_fn=self._guard_reason,
-                kick_reason_fn=lambda target: self._kick_reason(kit, target),
+                kick_reason_fn=lambda target, context: self._kick_reason(
+                    kit,
+                    target,
+                    context,
+                ),
                 hold_vyaw=0.12,
             ),
         )

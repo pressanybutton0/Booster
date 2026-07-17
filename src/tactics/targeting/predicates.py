@@ -34,14 +34,35 @@ __all__ = [
 # Field-geometry predicates
 
 
-def ball_in_own_defensive_area(config: SoccerConfig, ball: BallState) -> bool:
-    """Whether the ball is in our dangerous area where the goalkeeper should clear it."""
+def ball_in_own_defensive_area(
+    config: SoccerConfig,
+    ball: BallState,
+    extra_margin_m: float = 0.0,
+) -> bool:
+    """Whether the ball is close enough to our goal for a keeper clearance.
 
-    area_x = -config.field_length * 0.18
+    The old boundary started at ``-0.18 * field_length`` (``x=-2.52`` on the
+    adult field), which let the goalkeeper abandon its guard point for balls
+    almost at midfield. Anchor the zone to the actual goal-area geometry and
+    keep it centred on the goal mouth instead. ``extra_margin_m`` is used only
+    as an exit band after a clearance has already begun.
+    """
+
+    guard_x = (
+        -config.field_length / 2.0
+        + config.goal_area_length
+        + 0.50
+    )
+    area_x = (
+        guard_x
+        + config.strategy.goalkeeper_challenge_margin_m
+        + max(0.0, extra_margin_m)
+    )
     area_y = min(
         config.field_width / 2.0 - 0.35,
-        config.penalty_area_width / 2.0
-        + config.strategy.goalkeeper_challenge_margin_m,
+        config.goal_width / 2.0
+        + config.strategy.goalkeeper_challenge_margin_m
+        + max(0.0, extra_margin_m),
     )
     return ball.x < area_x and abs(ball.y) <= area_y
 

@@ -71,8 +71,16 @@ class Targeting:
 
     # Field predicates and player scoring
 
-    def ball_in_own_defensive_area(self, ball: BallState) -> bool:
-        return predicates.ball_in_own_defensive_area(self.config, ball)
+    def ball_in_own_defensive_area(
+        self,
+        ball: BallState,
+        extra_margin_m: float = 0.0,
+    ) -> bool:
+        return predicates.ball_in_own_defensive_area(
+            self.config,
+            ball,
+            extra_margin_m=extra_margin_m,
+        )
 
     def ball_beyond_goal_line(self, ball: BallState) -> bool:
         return predicates.ball_beyond_goal_line(self.config, ball)
@@ -154,6 +162,17 @@ class Targeting:
             player_id, context, is_player_allowed,
         )
 
+    def best_backpass_target(
+        self,
+        player_id: int,
+        context: PlayContext,
+        is_player_allowed: PlayerAllowed,
+    ) -> Pose2D | None:
+        return attack.best_backpass_target(
+            self.config, self.field, self.obstacles,
+            player_id, context, is_player_allowed,
+        )
+
     def shot_lane_is_clear(
         self,
         context: PlayContext,
@@ -181,8 +200,14 @@ class Targeting:
         self,
         target: Pose2D,
         default: str = "chaser kick",
+        ball: BallState | None = None,
     ) -> str:
-        return attack.kick_reason(self.config, target, default=default)
+        return attack.kick_reason(
+            self.config,
+            target,
+            default=default,
+            ball=ball,
+        )
 
     # Support positioning
 

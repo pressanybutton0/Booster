@@ -68,15 +68,20 @@ class RobotClient:
     _GET_UP_FAILURE_RETRY_MAX_SEC = 8.0
     # get_up() starts an asynchronous task. The SDK can report ``walk`` while
     # that task still owns the chassis, so mode alone cannot safely release
-    # velocity commands. Most SoccerSim recoveries complete in about 5.8s, but
-    # the latest collision run still had an accepted task active after 6.5s.
-    # Keep an 8s ownership window so a second get_up cannot overlap it.
-    _GET_UP_SETTLE_INTERVAL_SEC = 8.0
+    # velocity commands. Most SoccerSim recoveries complete in about 5.8s.
+    # Retry at 6.5s when the robot is still down: the referee's incapable-robot
+    # window is 10s, so the old 8s gate left too little time for a failed first
+    # attempt to change the measured body orientation before a penalty.
+    _GET_UP_SETTLE_INTERVAL_SEC = 6.5
     _WALK_MODE_RETRY_INTERVAL_SEC = 1.0
     # When a walking robot falls, mode changes to damping slightly before the
     # fall_down state becomes "fallen". Give that sensor a short window before
     # treating damping as an ordinary mode-loss and calling set_mode(walk).
     _UNEXPECTED_NON_WALK_GRACE_SEC = 1.75
+    # A failed SoccerKickManager.stop() is not proof that the background kick
+    # task stopped. Keep ownership locally and retry, but do not hammer the SDK
+    # at control-loop frequency while a robot is fallen or penalised.
+    _KICK_STOP_RETRY_INTERVAL_SEC = 0.5
 
     def __init__(
         self,
@@ -110,6 +115,7 @@ class RobotClient:
         # Kick state machine
         self._kick_enabled = False
         self._kick_started_at = 0.0
+        self._kick_stop_retry_after = 0.0
 
     # Identity
 
@@ -373,7 +379,8 @@ class RobotClient:
         :meth:`_apply_move` against kick/move boundary flapping.
         """
 
-        self._release_kick(force=True, reason=reason)
+        if not self._release_kick(force=True, reason=reason):
+            return
         if (
             self._cached_status.is_fall_down_normal
             and self._cached_status.mode in {None, "walk"}
@@ -472,15 +479,20 @@ class RobotClient:
                 error=str(exc),
                 reason=reason,
             )
-            self._kick_enabled = False
+            # If start() succeeded, the background kick task may still own the
+            # chassis even though an update failed. Leave the flag set so the
+            # next stop/move command confirms release through stop().
 
     def _release_kick(self, *, force: bool, reason: str) -> bool:
         """Release chassis control from kicking; return False while still inside minimum active duration."""
 
         if not self._kick_enabled:
             return True
-        active_for = time.monotonic() - self._kick_started_at
+        now = time.monotonic()
+        active_for = now - self._kick_started_at
         if not force and active_for < self._config.strategy.soccer_kick_min_active_sec:
+            return False
+        if now < self._kick_stop_retry_after:
             return False
         self._logger.info(
             f"Stopping SoccerKickManager for player {self._player_id}: "
@@ -499,6 +511,9 @@ class RobotClient:
                 force=force,
             )
         except Exception as exc:
+            self._kick_stop_retry_after = (
+                now + self._KICK_STOP_RETRY_INTERVAL_SEC
+            )
             self._logger.warn(
                 f"SoccerKickManager stop failed for player {self._player_id}: "
                 f"{exc.__class__.__name__}: {exc}",
@@ -511,8 +526,9 @@ class RobotClient:
                 error_type=exc.__class__.__name__,
                 error=str(exc),
             )
-        finally:
-            self._kick_enabled = False
+            return False
+        self._kick_enabled = False
+        self._kick_stop_retry_after = 0.0
         return True
 
     # Private status snapshot polling

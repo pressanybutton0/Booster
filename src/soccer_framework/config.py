@@ -131,6 +131,14 @@ class SoccerStrategyTuning:
     pass_lane_clearance: float = 0.75  #  Required clearance around the pass lane to avoid interception.
     shot_lane_min_score: float = 0.55  #  Minimum clear-lane score required for a direct shot.
 
+    # Blocked-shot relief pass
+    # A center chaser may recycle possession to a safe non-keeper teammate when
+    # no forward pass qualifies and the direct shot lane is blocked.
+    backpass_enabled: bool = True
+    backpass_min_retreat_m: float = 0.35
+    backpass_max_retreat_m: float = 3.0
+    backpass_receiver_clearance_m: float = 0.80
+
     # Dribbling
     dribble_advance_m: float = 1.5  #  Fluid default; aggressive profile raises this to 2.0.
     dribble_center_pull: float = 0.65  #  Pull toward centerline while dribbling to avoid hugging the sideline.
@@ -142,6 +150,7 @@ class SoccerStrategyTuning:
 
     # Goalkeeping and challenges
     goalkeeper_challenge_margin_m: float = 0.70  #  Margin that triggers goalkeeper challenge.
+    goalkeeper_clear_exit_margin_m: float = 0.35  #  Hysteresis beyond the entry zone before returning to guard.
 
     # Sideline and goal-line recovery
     sideline_recovery_margin_m: float = 0.90  #  Sideline distance threshold for recovery.

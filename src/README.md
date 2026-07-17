@@ -266,9 +266,10 @@ class GoalkeeperRole(RoleStrategy):
                 kick_target_fn=lambda context: self.kick_target(kit, player_id, context),
                 wants_kick_fn=lambda context: self.wants_to_kick(kit, player_id, context),
                 reason_fn=lambda: "goalkeeper guard",
-                kick_reason_fn=lambda target: kit.targeting.kick_reason(
+                kick_reason_fn=lambda target, context: kit.targeting.kick_reason(
                     target,
                     default="goalkeeper clear",
+                    ball=context.known_ball,
                 ),
             ),
         )

@@ -262,6 +262,16 @@ SUBSTITUTE
 - `teams[].score`：比分。
 - `teams[].players[player_id - 1].penalty` 与 `secsTillUnpenalised`：判断本方球员是否可参与比赛。
 
+运行时会比较连续的 GameController 包，并只在状态转换时输出规则日志：
+
+- `game_controller_player_penalised`：记录 `player_id`、处罚枚举、剩余罚时、warning/caution 和比赛状态。
+- `game_controller_player_penalty_changed`：处罚期间原因发生变化。
+- `game_controller_player_penalty_cleared`：球员恢复可参赛。
+- `game_controller_player_discipline_changed`：warning/caution 计数变化，只写结构化日志。
+- `game_controller_score_changed`：任一队比分变化，作为后续策略评分/奖励统计的可靠输入。
+
+罚时每秒递减不会重复输出控制台日志，避免一次 30 秒处罚刷出 30 行；首次进入处罚和恢复时各记录一次。
+
 ### 订阅示例
 
 ```python

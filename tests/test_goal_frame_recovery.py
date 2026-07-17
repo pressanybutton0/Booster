@@ -8,11 +8,13 @@ import unittest
 from src.soccer_framework import (
     BallState,
     GameControlState,
+    GameState,
     MoveIntent,
     PlayContext,
     Pose2D,
     RobotState,
     SoccerConfig,
+    SetPlay,
 )
 from src.tactics.geometry import TeamFieldFrame
 from src.tactics.kick_hysteresis import KickHysteresis
@@ -36,10 +38,12 @@ def _context(
     pose: Pose2D,
     *,
     opponent_pose: Pose2D | None = None,
+    ball: BallState | None = None,
+    game: GameControlState | None = None,
 ) -> PlayContext:
     return PlayContext(
-        game_state=GameControlState(),
-        ball=BallState(),
+        game_state=game or GameControlState(),
+        ball=ball or BallState(),
         teammates={1: RobotState(1, pose, 1.0)},
         opponents=(
             {1: RobotState(1, opponent_pose, 1.0)}
@@ -143,6 +147,26 @@ class GoalFrameRecoveryTests(unittest.TestCase):
             math.hypot(clear_escape.x - opponent.x, clear_escape.y - opponent.y),
         )
 
+    def test_opponent_restart_ball_is_part_of_goal_escape_scoring(self) -> None:
+        controller = _controller()
+        pose = Pose2D(7.30, 1.42, math.pi)
+        ball = BallState(x=6.75, y=1.05, last_seen_at=1.0)
+        game = GameControlState(
+            state=GameState.PLAYING,
+            set_play=SetPlay.DIRECT_FREE_KICK,
+            kicking_team=2,
+        )
+        context = _context(pose, ball=ball, game=game)
+
+        escape = controller._goal_escape_target(1, pose, context)
+
+        self.assertIsNotNone(escape)
+        assert escape is not None
+        self.assertGreater(
+            math.hypot(escape.x - ball.x, escape.y - ball.y),
+            math.hypot(pose.x - ball.x, pose.y - ball.y),
+        )
+
     def test_pinned_robot_translates_without_waiting_for_turn(self) -> None:
         controller = _controller()
         pose = Pose2D(6.95, 1.28, 0.0)
@@ -214,6 +238,37 @@ class GoalFrameRecoveryTests(unittest.TestCase):
         self.assertEqual(
             controller._goal_escape_progress_by_player[1].route_index,
             1,
+        )
+
+    def test_behind_net_progress_does_not_flip_rear_corner_at_four_seconds(self) -> None:
+        now = [0.0]
+        controller = _controller(clock=lambda: now[0])
+
+        controller._goal_escape_target(
+            1,
+            Pose2D(7.95, 0.0, math.pi),
+            _context(Pose2D(7.95, 0.0, math.pi)),
+        )
+        now[0] = 1.0
+        controller._goal_escape_target(
+            1,
+            Pose2D(8.00, 0.25, math.pi),
+            _context(Pose2D(8.00, 0.25, math.pi)),
+        )
+        now[0] = 4.1
+        controller._goal_escape_target(
+            1,
+            Pose2D(8.10, 0.80, math.pi),
+            _context(Pose2D(8.10, 0.80, math.pi)),
+        )
+
+        self.assertEqual(
+            controller._goal_escape_progress_by_player[1].phase,
+            "behind_net",
+        )
+        self.assertEqual(
+            controller._goal_escape_progress_by_player[1].route_index,
+            0,
         )
 
     def test_escape_route_opens_clearance_from_touched_post(self) -> None:
