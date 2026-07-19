@@ -33,8 +33,11 @@ from .predicates import ball_near_sideline
 __all__ = [
     "PlayerAllowed",
     "best_backpass_target",
+    "best_corner_receiver_target",
     "best_pass_target",
+    "corner_delivery_target",
     "dribble_target",
+    "goal_kick_delivery_target",
     "kick_reason",
     "lane_clear_score",
     "select_clear_or_pass_target",
@@ -61,15 +64,24 @@ def select_kick_target(
 ) -> Pose2D:
     """Decide this tick's aim target for a center chaser.
 
-    Decision order: sideline recovery, restart touch, best pass, clear shot lane,
-    and finally dribble forward.
+    Decision order: corner cutback, sideline recovery, restart touch, a close
+    clear shot, useful pass, safe backpass, and finally dribble forward.
     """
 
     ball = context.known_ball
+    game = context.known_game
+    if _is_own_corner(config, game):
+        return corner_delivery_target(
+            config, field, obstacles,
+            player_id, context, is_player_allowed,
+        )
+
+    if _is_own_goal_kick(config, game):
+        return goal_kick_delivery_target(config, field, ball)
+
     if ball_near_sideline(config, ball):
         return recovery.sideline_recovery_target(config, field, ball)
 
-    game = context.known_game
     if should_make_restart_touch(config, game):
         teammate = best_pass_target(
             config, obstacles,
@@ -79,15 +91,22 @@ def select_kick_target(
             return Pose2D(teammate.x, teammate.y, 0.0)
         return dribble_target(config, field, ball)
 
+    distance_to_goal = math.hypot(
+        field.opponent_goal_x() - ball.x,
+        ball.y,
+    )
+    if (
+        distance_to_goal <= config.strategy.shot_max_distance_m
+        and shot_lane_is_clear(config, field, obstacles, context)
+    ):
+        return Pose2D(field.opponent_goal_x(), 0.0, 0.0)
+
     teammate = best_pass_target(
         config, obstacles,
         player_id, context, is_player_allowed,
     )
     if teammate is not None:
         return Pose2D(teammate.x, teammate.y, 0.0)
-
-    if shot_lane_is_clear(config, field, obstacles, context):
-        return Pose2D(field.opponent_goal_x(), 0.0, 0.0)
 
     backpass = best_backpass_target(
         config, field, obstacles,
@@ -112,6 +131,15 @@ def select_clear_or_pass_target(
     """
 
     ball = context.known_ball
+    if _is_own_corner(config, context.known_game):
+        return corner_delivery_target(
+            config, field, obstacles,
+            player_id, context, is_player_allowed,
+        )
+
+    if _is_own_goal_kick(config, context.known_game):
+        return goal_kick_delivery_target(config, field, ball)
+
     if ball_near_sideline(config, ball):
         return recovery.sideline_recovery_target(config, field, ball)
 
@@ -137,6 +165,153 @@ def should_make_restart_touch(
         game.is_restart_for_team(config.team_id)
         and game.set_play in {SetPlay.THROW_IN, SetPlay.INDIRECT_FREE_KICK}
     )
+
+
+def _is_own_corner(config: SoccerConfig, game: GameControlState) -> bool:
+    return (
+        game.is_restart_for_team(config.team_id)
+        and game.set_play == SetPlay.CORNER_KICK
+    )
+
+
+def _is_own_goal_kick(config: SoccerConfig, game: GameControlState) -> bool:
+    return (
+        game.is_restart_for_team(config.team_id)
+        and game.set_play == SetPlay.GOAL_KICK
+    )
+
+
+def goal_kick_delivery_target(
+    config: SoccerConfig,
+    field: TeamFieldFrame,
+    ball: BallState,
+) -> Pose2D:
+    """Return a stable one-touch goal-kick lane clear of both receivers.
+
+    The aim depends only on the restart ball placement, not on per-tick obstacle
+    scores, so the kick manager cannot keep steering left/right while active.
+    Field players occupy wider lanes in :func:`support_target`.
+    """
+
+    if ball.y > 0.25:
+        side = 1.0
+    elif ball.y < -0.25:
+        side = -1.0
+    else:
+        side = 1.0
+    return field.clamp_inside_field(
+        Pose2D(
+            min(field.opponent_goal_x() - 0.75, ball.x + 4.2),
+            side * 1.55,
+            field.attack_theta(),
+        ),
+        margin=0.35,
+    )
+
+
+def corner_delivery_target(
+    config: SoccerConfig,
+    field: TeamFieldFrame,
+    obstacles: ObstacleCollector,
+    player_id: int,
+    context: PlayContext,
+    is_player_allowed: PlayerAllowed,
+) -> Pose2D:
+    """Return a straight, low corner delivery instead of aiming at goal.
+
+    SoccerSim robots cannot bend a shot around the goal frame. Prefer the
+    active field teammate in the central receiving lane; if that player is
+    unavailable or marked, cut the ball back to an open point near the top of
+    the penalty area. The fallback is deliberately outside the goal mouth, so
+    this branch can never become a direct corner shot.
+    """
+
+    receiver = best_corner_receiver_target(
+        config,
+        field,
+        obstacles,
+        player_id,
+        context,
+        is_player_allowed,
+    )
+    if receiver is not None:
+        return Pose2D(receiver.x, receiver.y, 0.0)
+
+    ball = context.known_ball
+    side = 1.0 if ball.y >= 0.0 else -1.0
+    return field.clamp_inside_field(
+        Pose2D(
+            field.opponent_goal_x() - 2.15,
+            side * 0.75,
+            field.attack_theta(),
+        ),
+        margin=0.35,
+    )
+
+
+def best_corner_receiver_target(
+    config: SoccerConfig,
+    field: TeamFieldFrame,
+    obstacles: ObstacleCollector,
+    player_id: int,
+    context: PlayContext,
+    is_player_allowed: PlayerAllowed,
+) -> Pose2D | None:
+    """Pick a legal non-keeper teammate for a corner cutback."""
+
+    ball = context.known_ball
+    game = context.known_game
+    opponents = obstacles.opponent_obstacles(context)
+    ideal_x = field.opponent_goal_x() - 2.15
+    candidates: list[tuple[float, Pose2D]] = []
+    for teammate_id, robot in context.teammates.items():
+        if teammate_id == player_id or robot.pose is None:
+            continue
+        if config.ready_slot_for_player(teammate_id) == ReadySlot.KEEPER:
+            continue
+        if not is_player_allowed(game, teammate_id):
+            continue
+
+        distance = math.hypot(robot.pose.x - ball.x, robot.pose.y - ball.y)
+        if distance < config.strategy.pass_min_distance_m:
+            continue
+        lane_score = lane_clear_score(
+            config,
+            ball.x,
+            ball.y,
+            robot.pose.x,
+            robot.pose.y,
+            opponents,
+        )
+        if lane_score < config.strategy.pass_min_score:
+            continue
+        nearest_opponent = min(
+            (
+                math.hypot(robot.pose.x - obstacle.x, robot.pose.y - obstacle.y)
+                - obstacle.radius
+                for obstacle in opponents
+            ),
+            default=float("inf"),
+        )
+        if nearest_opponent < config.strategy.backpass_receiver_clearance_m:
+            continue
+
+        centrality = 1.0 - clamp(
+            abs(robot.pose.y) / (config.field_width / 2.0),
+            0.0,
+            1.0,
+        )
+        top_of_box = 1.0 - clamp(
+            abs(robot.pose.x - ideal_x) / 4.0,
+            0.0,
+            1.0,
+        )
+        score = 0.55 * lane_score + 0.25 * centrality + 0.20 * top_of_box
+        candidates.append((score, robot.pose))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
 
 
 # Pass scoring
@@ -177,6 +352,8 @@ def best_pass_target(
             obstacles.opponent_obstacles(context),
         )
         distance = math.hypot(robot.pose.x - ball.x, robot.pose.y - ball.y)
+        if distance < config.strategy.pass_min_distance_m:
+            continue
         field_score = clamp(
             forward_gain / max(1.0, config.field_length),
             0.0,
@@ -217,6 +394,12 @@ def best_backpass_target(
         return None
 
     ball = context.known_ball
+    if _is_own_corner(config, context.known_game):
+        return corner_delivery_target(
+            config, field, obstacles,
+            player_id, context, is_player_allowed,
+        )
+
     game = context.known_game
     opponent_obstacles = obstacles.opponent_obstacles(context)
     own_penalty_front = field.own_goal_x() + config.penalty_area_length

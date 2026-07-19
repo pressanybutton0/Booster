@@ -60,7 +60,7 @@ from .safety_subtree import (
 )
 
 if TYPE_CHECKING:
-    from ..play.playbook import Playbook
+    from ..play.playbook import Playbook, RoleAssignment
     from ..runtime import RobotServices, SoccerKit
 
 
@@ -215,6 +215,15 @@ class TeamStrategyTree:
     @property
     def last_commands(self) -> dict[int, RobotCommand]:
         return dict(self._committer.last_committed)
+
+    @property
+    def last_role_assignment(self) -> "RoleAssignment | None":
+        """Latest PLAY role/ball-claim snapshot, or ``None`` outside PLAY."""
+
+        from ..play.playbook import RoleAssignment
+
+        value = self._context_reader.read(BlackboardKeys.ROLES)
+        return value if isinstance(value, RoleAssignment) else None
 
     @property
     def last_executed_commands(self) -> dict[int, RobotCommand]:

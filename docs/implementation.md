@@ -99,7 +99,7 @@ flowchart LR
 
 | 类 | 职责 |
 | --- | --- |
-| `TeamRobotManager` | 管理 `BoosterRobot` 和对应 `SoccerKickManager`。对策略层只暴露运行状态轮询、起身/模式恢复和最终命令执行：`set_velocity`、`SoccerKickManager.start/update/stop`；soccer/walk mode 只在 READY/PLAYING 阶段需要行走命令时恢复。异步 `get_up()` 触发后以 6.5 秒本地保护窗持续标记 `getting_up`，防止 SDK 提前报告 walk 时误发底盘命令，同时给首次起身失败保留裁判 10 秒窗口内的重试机会。`SoccerKickManager.stop()` 失败时保留本地底盘所有权并限频重试，确认停止前不再错误地发送普通速度命令。 |
+| `TeamRobotManager` | 管理 `BoosterRobot` 和对应 `SoccerKickManager`。对策略层只暴露运行状态轮询、起身/模式恢复和最终命令执行：`set_velocity`、`SoccerKickManager.start/update/stop`；soccer/walk mode 只在 READY/PLAYING 阶段需要行走命令时恢复。异步 `get_up()` 触发后以 5.5 秒本地保护窗持续标记 `getting_up`；若 SDK 表示任务仍在运行则 1 秒后再检查，既防止提前误发底盘命令，也给首次起身失败保留裁判 10 秒窗口内的重试机会。`SoccerKickManager.stop()` 失败时保留本地底盘所有权并限频重试，确认停止前不再错误地发送普通速度命令；单次连续踢球占用最多 6 秒，随后强制零速并冷却 0.75 秒。 |
 | `PlayerKickStateMachine` | 封装单个球员的踢球通道，处理 `SoccerKickManager.start/update/stop`、最小活跃时间和底盘通道释放。 |
 
 ### `src/soccer_framework/types.py`
@@ -479,7 +479,11 @@ flowchart TB
 - 没有球：由 `SafetyGuards` 在进入 PLAY 子树前全队停止，PLAY 战术层使用 `context.known_ball`。
 - 没有自身位姿：具体移动 / 踢球节点返回失败，最终走到 `WaitForBall`，输出停止等待。
 - 是 chaser 且 `IsInKickRange` 不通过：`ApproachBall` 用 `set_velocity` 走到球后方一个 `ReadySlot` 相关的偏移（`CENTER` / `SIDE` 为 `0.4m`，`KEEPER` 为 `0.22m`），朝向对方球门；队伍场地坐标系下球后方固定是 `ball.x - offset`。
-- 是 chaser 且 `IsInKickRange` 通过：`KickBall` 输出 `KickIntent`，由 `TeamRobotManager` 启用 `SoccerKickManager`。`IsInKickRange` 内部维护带迟滞的入 / 出场距离（默认 `soccer_kick_enter_distance=2.5m`、`soccer_kick_exit_distance=3.0m`），避免球距在阈值附近抖动时频繁 start / stop（实现见 [src/tactics/kick_hysteresis.py](../src/tactics/kick_hysteresis.py)）。
+- 是 chaser 且 `IsInKickRange` 通过：`KickBall` 输出 `KickIntent`，由 `TeamRobotManager` 启用 `SoccerKickManager`。`IsInKickRange` 内部维护带迟滞的入 / 出场距离（平衡档默认 `1.4m / 2.0m`），让机器人先由可观测的行走控制器主动接近、到近球区才交给自动踢球管理器；运行时另以 6 秒租约和 0.75 秒零速冷却限制单次底盘占用，避免长时间踢球任务跨越倒地或裁判停止窗口（实现见 [src/tactics/kick_hysteresis.py](../src/tactics/kick_hysteresis.py) 与 [src/soccer_framework/robot.py](../src/soccer_framework/robot.py)）。
+- `RoleAssignment.ball_owner_id` 每帧只给一名球员球权。尚未开始踢球时只保留 `0.03m` 的交接迟滞，robot1/2 谁明显更近就立即接管；`SoccerKickManager` 已启动后才使用较宽迟滞，避免一次正常出球被中途换人打断。supporter/defender 不再加入同一个球的争抢，而是保持接应或二点保护。
+- 主追球队员和正在出击的门将在接近球时进入“争球通道”：仍避让队友、门框和无关对手，但不再把贴着球的对手当成必须绕行的路径障碍。
+- 己方门球使用固定斜向出球点，两名场上球员分别站到宽接应通道，不再堵在门将正前方；球离开初始点 `0.45m` 后，本次门球球权锁定为完成并停止继续补踢，直到 GameController 清除门球状态。
+- 场上球员在对方球门口/门柱发生接触时，门框恢复器不再选择沿 `x` 轴穿过球门口的最短路径，而是先走到门柱外侧、球门宽度之外的射门角度，再恢复正常追球。处于本方门前实时扑救的门将仍由门将状态机优先控制。
 - 分到 supporter：`HoldSupportTarget` 走到 `Playbook.support_target` 给出的支援位。
 - 分到 defender：仅自定义 Playbook 显式注册时出现，`HoldDefenderTarget` 走到 `DefenderRole.target` 给出的防守位。
 - 分到 goalkeeper：`KeepGoal` 走到 `Playbook.goalkeeper_target` 给出的门将守位。
@@ -492,10 +496,11 @@ flowchart TB
 
 - chaser 的 `kick_target` 按 `ReadySlot` 分流：`CENTER` 走 `Targeting.select_kick_target`（射门 / 传球评分），`SIDE` 走 `Targeting.select_clear_or_pass_target`（解围 / 传球），`KEEPER` 走 keeper clear。
 - supporter 走 `Targeting.support_target`，站在球后方并按队友间距推开。
-- goalkeeper 直接走 `kit.ready_stance.goalkeeper_guard_target(ball)`，基础点在己方球门前（`x = -field_length/2 + goal_area_length + 0.50`），按球的横向位置在球门前小幅平移：
+- goalkeeper 由 `GoalkeeperStateMachine` 在 `GUARD / TRACK_SHOT / BLOCK_LINE / CLEAR / RECOVER` 之间切换。一般射门按速度投影到封堵平面；进入 `1.25m` 可踢范围的来球或角球传中直接切换到 `CLEAR`。当对手与球至少分离 `0.85m`、门将比场上队友更快且球仍在防守通道内时，门将可越过固定禁区边界主动出击；已经出击后使用退出迟滞完成解围。
+- 基础守位仍由 `kit.ready_stance.goalkeeper_guard_target(ball)` 生成，在己方球门前按球的横向位置小幅平移：
 
   ```text
   y = clamp(ball.y * 0.38, -1.35, 1.35)
   ```
 
-  避免第一版门将大范围离开门区。
+  SDK 的 `SoccerKickManager` 当前只接收 `direction` 和 `power`，没有高度参数，因此所谓“踢飞”在本版本实现为防守档最大力度的斜向直接解围，不伪装成尚未受底层支持的挑高球动作。

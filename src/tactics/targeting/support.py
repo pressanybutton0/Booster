@@ -11,6 +11,7 @@ import math
 
 from ...soccer_framework import (
     Pose2D,
+    SetPlay,
     SoccerConfig,
     PlayContext,
 )
@@ -31,20 +32,54 @@ def support_target(
 ) -> Pose2D:
     """Compute this tick's supporter target Pose2D.
 
-    Stay behind the ball by ``support_depth_m`` and laterally split by player_id parity, clamped to our half.
+    Stay behind the ball by ``support_depth_m`` and occupy a separate receiving
+    lane. Unlike the old implementation, the support player may enter the
+    attacking half instead of abandoning the ball carrier at midfield.
     Pushout: use :func:`_spaced_support_target` to avoid overlapping other supporters.
     """
 
-    side = 1.0 if player_id % 2 == 0 else -1.0
-    lateral = config.strategy.support_lateral_m * side
     ball = context.known_ball
-    x = ball.x - config.strategy.support_depth_m
-    x = field.own_half_x(x, margin=0.35)
-    y = clamp(
-        ball.y + lateral,
-        -config.field_width / 2.0 + 0.45,
-        config.field_width / 2.0 - 0.45,
-    )
+    game = context.known_game
+    own_penalty_front = field.own_goal_x() + config.penalty_area_length
+
+    if (
+        game.is_restart_for_team(config.team_id)
+        and game.set_play == SetPlay.GOAL_KICK
+    ):
+        # Two wide, stagger-free receiving lanes keep both bodies out of the
+        # keeper's initial clearance corridor.
+        x = own_penalty_front + 1.20
+        y = (1.0 if player_id % 2 == 0 else -1.0) * min(
+            config.penalty_area_width / 2.0 - 0.35,
+            config.field_width / 2.0 - 0.55,
+        )
+    elif (
+        game.is_restart_for_team(config.team_id)
+        and game.set_play == SetPlay.CORNER_KICK
+    ):
+        # Present a central, straight-line receiver for the corner taker. This
+        # is a low cutback target, not an attempted curved shot.
+        side = 1.0 if ball.y >= 0.0 else -1.0
+        x = field.opponent_goal_x() - 2.15
+        y = side * 0.75
+    else:
+        if abs(ball.y) > 0.50:
+            # When the carrier is wide, move toward the centre rather than
+            # following it into the same sideline corridor.
+            lane_sign = -1.0 if ball.y > 0.0 else 1.0
+        else:
+            lane_sign = 1.0 if player_id % 2 == 0 else -1.0
+        lateral = config.strategy.support_lateral_m * lane_sign
+        x = clamp(
+            ball.x - config.strategy.support_depth_m,
+            own_penalty_front + 0.50,
+            field.opponent_goal_x() - 1.10,
+        )
+        y = clamp(
+            ball.y + lateral,
+            -config.field_width / 2.0 + 0.45,
+            config.field_width / 2.0 - 0.45,
+        )
     target = field.clamp_inside_field(
         Pose2D(x, y, field.face_ball_theta(x, y, ball))
     )

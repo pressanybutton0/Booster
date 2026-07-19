@@ -69,10 +69,13 @@ class RobotClient:
     # get_up() starts an asynchronous task. The SDK can report ``walk`` while
     # that task still owns the chassis, so mode alone cannot safely release
     # velocity commands. Most SoccerSim recoveries complete in about 5.8s.
-    # Retry at 6.5s when the robot is still down: the referee's incapable-robot
-    # window is 10s, so the old 8s gate left too little time for a failed first
-    # attempt to change the measured body orientation before a penalty.
-    _GET_UP_SETTLE_INTERVAL_SEC = 6.5
+    # Recheck at 5.5s when the robot is still down: the referee's incapable-
+    # robot window is 10s, and a second accepted recovery at 6.5s proved too
+    # late to change the measured body orientation before a penalty.
+    _GET_UP_SETTLE_INTERVAL_SEC = 5.5
+    # If the SDK says the asynchronous task is still alive at that recheck, do
+    # not start a fresh full settle window. Poll again shortly instead.
+    _GET_UP_ALREADY_RUNNING_RECHECK_SEC = 1.0
     _WALK_MODE_RETRY_INTERVAL_SEC = 1.0
     # When a walking robot falls, mode changes to damping slightly before the
     # fall_down state becomes "fallen". Give that sensor a short window before
@@ -82,6 +85,11 @@ class RobotClient:
     # task stopped. Keep ownership locally and retry, but do not hammer the SDK
     # at control-loop frequency while a robot is fallen or penalised.
     _KICK_STOP_RETRY_INTERVAL_SEC = 0.5
+    # Long-lived kick tasks made the chassis difficult to release after a fall
+    # or referee stop. Bound one ownership burst, then leave a short neutral
+    # window before another KickIntent may start the manager again.
+    _KICK_MAX_ACTIVE_SEC = 6.0
+    _KICK_RESTART_COOLDOWN_SEC = 0.75
 
     def __init__(
         self,
@@ -116,6 +124,7 @@ class RobotClient:
         self._kick_enabled = False
         self._kick_started_at = 0.0
         self._kick_stop_retry_after = 0.0
+        self._kick_restart_after = 0.0
 
     # Identity
 
@@ -243,7 +252,10 @@ class RobotClient:
             self._get_up()
         except Exception as exc:
             if "get_up" in str(exc) and "already running" in str(exc):
-                self._mark_get_up_settling(now)
+                self._mark_get_up_settling(
+                    now,
+                    hold_sec=self._GET_UP_ALREADY_RUNNING_RECHECK_SEC,
+                )
                 self._logger.info(
                     f"Get-up already running for player {self._player_id}; "
                     "holding chassis commands",
@@ -284,14 +296,22 @@ class RobotClient:
         )
         return True
 
-    def _mark_get_up_settling(self, now: float) -> None:
+    def _mark_get_up_settling(
+        self,
+        now: float,
+        hold_sec: float | None = None,
+    ) -> None:
         """Keep the chassis blocked until the asynchronous get-up task settles."""
 
         self._get_up_failure_count = 0
         self._get_up_retry_after = 0.0
         self._get_up_settle_until = max(
             self._get_up_settle_until,
-            now + self._GET_UP_SETTLE_INTERVAL_SEC,
+            now + (
+                self._GET_UP_SETTLE_INTERVAL_SEC
+                if hold_sec is None
+                else max(0.0, hold_sec)
+            ),
         )
         previous = self._cached_status
         self._cached_status = RobotRuntimeStatus(
@@ -446,11 +466,31 @@ class RobotClient:
     def _apply_kick(self, intent: KickIntent, reason: str) -> None:
         """Handle one :class:`KickIntent`; while owning the chassis, only update kick command."""
 
+        now = time.monotonic()
+        if (
+            self._kick_enabled
+            and now - self._kick_started_at >= self._KICK_MAX_ACTIVE_SEC
+        ):
+            if self._release_kick(force=True, reason="kick lease expired"):
+                self._kick_restart_after = now + self._KICK_RESTART_COOLDOWN_SEC
+                if (
+                    self._cached_status.is_fall_down_normal
+                    and self._cached_status.mode in {None, "walk"}
+                ):
+                    self._dispatch_velocity(
+                        MoveIntent(),
+                        "kick lease cooldown",
+                    )
+            return
+        if not self._kick_enabled and now < self._kick_restart_after:
+            return
+
         try:
             if not self._kick_enabled:
                 self._start_kick()
                 self._kick_enabled = True
-                self._kick_started_at = time.monotonic()
+                self._kick_started_at = now
+                self._kick_restart_after = 0.0
                 self._logger.info(
                     "SoccerKickManager started",
                     event="soccer_kick_started",

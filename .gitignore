@@ -1,0 +1,5 @@
+.venv-training/
+training/runs/
+res/models/*_smoke.zip
+__pycache__/
+*.py[cod]

@@ -153,6 +153,8 @@ class AttackSubtreeConfig:
     reason_fn: ReasonFn | None = None
     kick_reason_fn: KickReasonFn | None = None
     hold_vyaw: float = 0.0
+    contest_ball_fn: WantsKickFn | None = None
+    goal_defense_fn: WantsKickFn | None = None
 
 
 class MoveToTarget(py_trees.behaviour.Behaviour):
@@ -171,6 +173,8 @@ class MoveToTarget(py_trees.behaviour.Behaviour):
         *,
         reason_fn: ReasonFn | None = None,
         hold_vyaw: float = 0.0,
+        contest_ball_fn: WantsKickFn | None = None,
+        goal_defense_fn: WantsKickFn | None = None,
     ):
         super().__init__(f"MoveToTarget({player_id})")
         self._kit = kit
@@ -180,6 +184,8 @@ class MoveToTarget(py_trees.behaviour.Behaviour):
             lambda: _default_move_reason(player_id)
         )
         self._hold_vyaw = hold_vyaw
+        self._contest_ball_fn = contest_ball_fn
+        self._goal_defense_fn = goal_defense_fn
         self.blackboard = BlackboardClient(name=self.name)
 
     def update(self) -> py_trees.common.Status:
@@ -194,12 +200,27 @@ class MoveToTarget(py_trees.behaviour.Behaviour):
         kit = self._kit
         player_id = self._player_id
         kit.kicker.clear_player(player_id)
+        contest_ball = None
+        if self._contest_ball_fn is not None:
+            try:
+                if self._contest_ball_fn(context):
+                    contest_ball = context.known_ball
+            except ValueError:
+                pass
+        goal_defense_active = False
+        if self._goal_defense_fn is not None:
+            try:
+                goal_defense_active = self._goal_defense_fn(context)
+            except ValueError:
+                pass
         command = kit.motion.move_to_target(
             player_id,
             context,
             target,
             self._reason_fn(),
             hold_vyaw=self._hold_vyaw,
+            contest_ball=contest_ball,
+            goal_defense_active=goal_defense_active,
         )
         self.blackboard.write(cmd_key(player_id), command)
         return py_trees.common.Status.SUCCESS
@@ -256,6 +277,25 @@ class KickAction(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.SUCCESS
 
 
+class IsBallOwner(py_trees.behaviour.Behaviour):
+    """Succeed only for the single ball claimant selected this tick."""
+
+    def __init__(self, player_id: int):
+        super().__init__(f"IsBallOwner({player_id})")
+        self._player_id = player_id
+        self.blackboard = BlackboardClient(name=self.name)
+
+    def update(self) -> py_trees.common.Status:
+        assignment = self.blackboard.read(BlackboardKeys.ROLES)
+        if not isinstance(assignment, RoleAssignment):
+            return py_trees.common.Status.FAILURE
+        return (
+            py_trees.common.Status.SUCCESS
+            if assignment.owns_ball(self._player_id)
+            else py_trees.common.Status.FAILURE
+        )
+
+
 class IsKickWanted(py_trees.behaviour.Behaviour):
     """Condition leaf that calls ``wants_kick_fn`` to decide whether this tick wants a kick."""
 
@@ -308,7 +348,12 @@ def build_attack_subtree(
     before this PLAY subtree runs.
     """
 
-    kick_children: list[py_trees.behaviour.Behaviour] = []
+    # Every standard kicking role passes through the same team-level claim.
+    # This is deliberately independent of role-specific ``wants_kick_fn`` so a
+    # future role cannot accidentally start a second kick manager.
+    kick_children: list[py_trees.behaviour.Behaviour] = [
+        IsBallOwner(player_id)
+    ]
     if config.wants_kick_fn is not None:
         kick_children.append(IsKickWanted(kit, player_id, config.wants_kick_fn))
     kick_children.extend(
@@ -338,6 +383,8 @@ def build_attack_subtree(
                 config.target_fn,
                 reason_fn=config.reason_fn,
                 hold_vyaw=config.hold_vyaw,
+                contest_ball_fn=config.contest_ball_fn,
+                goal_defense_fn=config.goal_defense_fn,
             ),
         ],
     )

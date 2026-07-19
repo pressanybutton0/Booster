@@ -77,6 +77,10 @@ _GOAL_ESCAPE_ROUTE_MAX_SEC = 4.0
 # Actual no-progress still uses the two-second stall detector; this longer cap
 # only allows a robot that is genuinely translating to finish the chosen side.
 _GOAL_ESCAPE_BEHIND_NET_ROUTE_MAX_SEC = 12.0
+# During a deliberate ball challenge, an opponent already contesting the ball
+# is the objective rather than a path-planning obstacle.  Ignore only that
+# opponent; teammates, the goal frame, and unrelated opponents remain active.
+_CONTEST_OPPONENT_IGNORE_RADIUS_M = 0.90
 
 
 @dataclass(frozen=True)
@@ -131,6 +135,8 @@ class MotionController:
         reason: str,
         arrive_distance: float | None = None,
         hold_vyaw: float = 0.0,
+        contest_ball: BallState | None = None,
+        goal_defense_active: bool = False,
     ) -> RobotCommand:
         """Generate a movement command with avoidance applied.
 
@@ -147,7 +153,12 @@ class MotionController:
         # normal tangent avoidance.  In particular, a robot behind the back net
         # must go around a rear corner rather than drive straight toward the ball.
         safe_target = self._project_out_of_goal(target)
-        escape_target = self._goal_escape_target(player_id, robot.pose, context)
+        escape_target = self._goal_escape_target(
+            player_id,
+            robot.pose,
+            context,
+            suppress_infield_frame_escape=goal_defense_active,
+        )
         if escape_target is not None:
             self._avoid_side_by_player.pop(player_id, None)
             adjusted_target = escape_target
@@ -160,7 +171,11 @@ class MotionController:
             adjusted_reason = f"{reason} escape goal frame{route_detail}"
         else:
             adjusted_target = self._avoidance_target(
-                player_id, robot.pose, safe_target, context
+                player_id,
+                robot.pose,
+                safe_target,
+                context,
+                contest_ball=contest_ball,
             )
             if adjusted_target != safe_target:
                 adjusted_reason = f"{reason} via obstacle"
@@ -198,6 +213,7 @@ class MotionController:
             player_id,
             context,
             command,
+            contest_ball=contest_ball,
         )
 
     def kick_command(
@@ -234,8 +250,8 @@ class MotionController:
         """Approach target behind the ball: step back by ``approach_offset`` opposite the kick direction, then clamp inside the field."""
         return self._field.clamp_inside_field(
             Pose2D(
-                x=ball.x - approach_offset,
-                y=ball.y,
+                x=ball.x - approach_offset * math.cos(kick_theta),
+                y=ball.y - approach_offset * math.sin(kick_theta),
                 theta=kick_theta,
             )
         )
@@ -272,6 +288,7 @@ class MotionController:
         player_id: int,
         start: Pose2D,
         context: PlayContext,
+        suppress_infield_frame_escape: bool = False,
     ) -> Pose2D | None:
         """Return a topology-safe recovery point around the goal frame.
 
@@ -296,6 +313,14 @@ class MotionController:
         half_width = self._config.field_width / 2.0
         half_goal_width = self._config.goal_width / 2.0
         abs_x = abs(start.x)
+        if suppress_infield_frame_escape and abs_x <= half_length:
+            # During an active save, touching a post from the playable side must
+            # not replace the block/clear target with the generic escape route.
+            # Once the keeper is actually behind the line, topology recovery is
+            # still mandatory and this guard no longer applies.
+            self._goal_escape_plan_by_player.pop(player_id, None)
+            self._goal_escape_progress_by_player.pop(player_id, None)
+            return None
         if not frame_overlap and abs_x <= half_length:
             self._goal_escape_plan_by_player.pop(player_id, None)
             self._goal_escape_progress_by_player.pop(player_id, None)
@@ -334,13 +359,24 @@ class MotionController:
             )
         elif abs(start.y) <= half_goal_width:
             escape_phase = "mouth"
-            candidates = (
-                (escape_x, clamp(start.y, -inner_y, inner_y)),
-                (escape_x, start.y),
-                (escape_x, -sign_y * inner_y),
-                (near_line_x, sign_y * outer_y),
-                (near_line_x, -sign_y * outer_y),
-            )
+            if sign_x > 0.0 and player_id != self._config.goalkeeper_player_id():
+                # An attacker at the opponent post must go around the post to a
+                # shooting angle.  The old straight-x candidate stayed inside
+                # the goal mouth and visibly walked the player into the net.
+                candidates = (
+                    (near_line_x, sign_y * outer_y),
+                    (escape_x, sign_y * outer_y),
+                    (near_line_x, -sign_y * outer_y),
+                    (escape_x, -sign_y * outer_y),
+                )
+            else:
+                candidates = (
+                    (escape_x, clamp(start.y, -inner_y, inner_y)),
+                    (escape_x, start.y),
+                    (escape_x, -sign_y * inner_y),
+                    (near_line_x, sign_y * outer_y),
+                    (near_line_x, -sign_y * outer_y),
+                )
         else:
             escape_phase = "side_contact"
             candidates = (
@@ -585,6 +621,7 @@ class MotionController:
         start: Pose2D,
         target: Pose2D,
         context: PlayContext,
+        contest_ball: BallState | None = None,
     ) -> Pose2D:
         """Insert a detour via point on the original path.
 
@@ -592,7 +629,13 @@ class MotionController:
         new target. With no obstacle, returns target and clears the player's side memory.
         The via point is clamped inside the field.
         """
-        obstacle = self._first_blocking_obstacle(player_id, start, target, context)
+        obstacle = self._first_blocking_obstacle(
+            player_id,
+            start,
+            target,
+            context,
+            contest_ball=contest_ball,
+        )
         if obstacle is None:
             self._avoid_side_by_player.pop(player_id, None)
             return target
@@ -609,6 +652,7 @@ class MotionController:
         start: Pose2D,
         target: Pose2D,
         context: PlayContext,
+        contest_ball: BallState | None = None,
     ) -> Obstacle | None:
         """Find the first obstacle that truly blocks the start-to-target segment.
 
@@ -628,7 +672,23 @@ class MotionController:
         left_x = -dir_y
         left_y = dir_x
         best: tuple[float, Obstacle] | None = None
-        for obstacle in self._obstacles.collect_all(player_id, context):
+        opponent_obstacles = self._obstacles.opponent_obstacles(context)
+        if contest_ball is not None:
+            opponent_obstacles = tuple(
+                obstacle
+                for obstacle in opponent_obstacles
+                if math.hypot(
+                    obstacle.x - contest_ball.x,
+                    obstacle.y - contest_ball.y,
+                )
+                > _CONTEST_OPPONENT_IGNORE_RADIUS_M
+            )
+        obstacles = (
+            opponent_obstacles
+            + self._obstacles.teammate_obstacles(player_id, context)
+            + self._obstacles.goal_structure_obstacles()
+        )
+        for obstacle in obstacles:
             rel_x = obstacle.x - start.x
             rel_y = obstacle.y - start.y
             along = rel_x * dir_x + rel_y * dir_y
@@ -831,6 +891,7 @@ class MotionController:
         player_id: int,
         context: PlayContext,
         command: RobotCommand,
+        contest_ball: BallState | None = None,
     ) -> RobotCommand:
         """Map nearby-neighbor threats to a vyaw bias added onto the command.
 
@@ -885,6 +946,15 @@ class MotionController:
 
         for opponent in context.opponents.values():
             if opponent.pose is None:
+                continue
+            if (
+                contest_ball is not None
+                and math.hypot(
+                    opponent.pose.x - contest_ball.x,
+                    opponent.pose.y - contest_ball.y,
+                )
+                <= _CONTEST_OPPONENT_IGNORE_RADIUS_M
+            ):
                 continue
             yaw_bias += neighbor_yaw_contribution(
                 opponent.pose.x - robot.pose.x,

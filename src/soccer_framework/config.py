@@ -74,13 +74,13 @@ class SoccerStrategyTuning:
 
     # Kick hysteresis
     # Use enter/exit thresholds plus delay to prevent flapping around distance boundaries.
-    soccer_kick_enter_distance: float = 2.5  #  Enter kick mode when distance to ball is below enter.
-    soccer_kick_exit_distance: float = 3.0  #  Exit kick mode when distance to ball is above exit; must exceed enter.
+    soccer_kick_enter_distance: float = 1.4  #  Approach under our motion controller, then enter automatic kick mode near the ball.
+    soccer_kick_exit_distance: float = 2.0  #  Exit kick mode when distance to ball is above exit; must exceed enter.
     # Use the precision guide's strong but controllable value; adaptive profiles
     # raise it to the documented 2.5 ceiling for attack and emergency clearances.
     soccer_kick_power: float = 2.2  #  Kick power.
     soccer_kick_min_active_sec: float = 1.0  #  Minimum active kick duration to avoid instant switching.
-    soccer_kick_exit_delay_sec: float = 1.5  #  Delay after exit condition before actually leaving kick mode.
+    soccer_kick_exit_delay_sec: float = 1.0  #  Delay after exit condition before actually leaving kick mode.
 
     # Set plays and restarts
     restart_touch_distance: float = 0.45  #  Distance threshold for "touched the ball".
@@ -123,13 +123,18 @@ class SoccerStrategyTuning:
     teammate_challenge_tie_margin_m: float = (
         0.15  #  Tie band for teammate ball-claim distances to prevent oscillating handoff.
     )
+    teammate_challenge_idle_margin_m: float = (
+        0.03  #  Fast handoff band while the incumbent has not started a kick.
+    )
 
     # Passing
     pass_enabled: bool = True  #  Master pass switch.
     pass_min_score: float = 0.52  #  Balanced default; adaptive profiles change this by match context.
     pass_min_forward_m: float = 0.35  #  Minimum useful forward progress.
+    pass_min_distance_m: float = 1.40  #  Reject face-to-face "passes" that send both field players into the same ball.
     pass_lane_clearance: float = 0.75  #  Required clearance around the pass lane to avoid interception.
     shot_lane_min_score: float = 0.55  #  Minimum clear-lane score required for a direct shot.
+    shot_max_distance_m: float = 4.80  #  Do not replace a midfield carry with a low-value long shot.
 
     # Blocked-shot relief pass
     # A center chaser may recycle possession to a safe non-keeper teammate when
@@ -151,6 +156,18 @@ class SoccerStrategyTuning:
     # Goalkeeping and challenges
     goalkeeper_challenge_margin_m: float = 0.70  #  Margin that triggers goalkeeper challenge.
     goalkeeper_clear_exit_margin_m: float = 0.35  #  Hysteresis beyond the entry zone before returning to guard.
+    goalkeeper_shot_min_speed_mps: float = 0.45  # Minimum negative-x speed treated as a live shot.
+    goalkeeper_shot_horizon_sec: float = 2.5  # Maximum linear prediction horizon for an incoming shot.
+    goalkeeper_block_offset_m: float = 0.90  # Infield distance from our goal line used as the blocking plane.
+    goalkeeper_block_imminent_sec: float = 0.55  # Urgent line-block threshold by time-to-contact.
+    goalkeeper_emergency_kick_distance_m: float = 1.25  # Close incoming ball/cross: attack it instead of only tracking it.
+    goalkeeper_goal_line_emergency_m: float = 0.45  # Goal-line band that always triggers clearance.
+    goalkeeper_recover_hold_sec: float = 0.60  # Stabilise before returning to normal guard.
+    goalkeeper_sweep_front_extension_m: float = 1.50  # How far beyond the penalty-area front a keeper may sweep a loose ball.
+    goalkeeper_sweep_max_distance_m: float = 3.90  # Maximum keeper-to-ball distance for a new sweeper claim.
+    goalkeeper_sweep_ball_free_m: float = 0.85  # Opponent-to-ball separation required before rushing out.
+    goalkeeper_sweep_teammate_advantage_m: float = 0.20  # Keeper must beat every field teammate by this distance.
+    goalkeeper_sweep_exit_margin_m: float = 0.35  # Hysteresis for finishing an already-started sweep.
 
     # Sideline and goal-line recovery
     sideline_recovery_margin_m: float = 0.90  #  Sideline distance threshold for recovery.

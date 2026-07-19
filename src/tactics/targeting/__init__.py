@@ -91,6 +91,20 @@ class Targeting:
     def ball_near_sideline(self, ball: BallState) -> bool:
         return predicates.ball_near_sideline(self.config, ball)
 
+    def keeper_should_sweep_loose_ball(
+        self,
+        context: PlayContext,
+        keeper_id: int,
+        *,
+        continuing: bool = False,
+    ) -> bool:
+        return predicates.keeper_should_sweep_loose_ball(
+            self.config,
+            context,
+            keeper_id,
+            continuing=continuing,
+        )
+
     def ball_is_in_midfield_or_own_half(self, ball: BallState) -> bool:
         return predicates.ball_is_in_midfield_or_own_half(self.config, ball)
 
@@ -161,6 +175,9 @@ class Targeting:
             self.config, self.obstacles,
             player_id, context, is_player_allowed,
         )
+
+    def goal_kick_delivery_target(self, ball: BallState) -> Pose2D:
+        return attack.goal_kick_delivery_target(self.config, self.field, ball)
 
     def best_backpass_target(
         self,

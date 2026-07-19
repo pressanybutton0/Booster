@@ -54,7 +54,7 @@ def _context(
 
 
 class GoalFrameRecoveryTests(unittest.TestCase):
-    def test_robot_touching_front_post_gets_forced_infield_escape(self) -> None:
+    def test_attacker_touching_front_post_routes_to_a_side_shooting_angle(self) -> None:
         controller = _controller()
         pose = Pose2D(6.95, 1.28, 0.0)
 
@@ -68,7 +68,7 @@ class GoalFrameRecoveryTests(unittest.TestCase):
         escape = controller._goal_escape_target(1, pose, context)
         assert escape is not None
         self.assertLess(escape.x, pose.x)
-        self.assertLess(escape.y, pose.y)
+        self.assertGreater(abs(escape.y), controller._config.goal_width / 2.0)
 
     def test_robot_near_but_not_touching_post_uses_normal_planning(self) -> None:
         controller = _controller()
@@ -141,11 +141,11 @@ class GoalFrameRecoveryTests(unittest.TestCase):
         )
 
         assert clear_escape is not None and pinned_escape is not None
-        self.assertNotEqual(pinned_escape, clear_escape)
-        self.assertGreater(
+        self.assertGreaterEqual(
             math.hypot(pinned_escape.x - opponent.x, pinned_escape.y - opponent.y),
             math.hypot(clear_escape.x - opponent.x, clear_escape.y - opponent.y),
         )
+        self.assertGreater(abs(pinned_escape.y), controller._config.goal_width / 2.0)
 
     def test_opponent_restart_ball_is_part_of_goal_escape_scoring(self) -> None:
         controller = _controller()
@@ -303,6 +303,31 @@ class GoalFrameRecoveryTests(unittest.TestCase):
         self.assertNotEqual(command.intent.vyaw, 0.0)
         self.assertIn("yaw avoid", command.reason)
 
+    def test_ball_challenge_does_not_detour_around_opponent_at_ball(self) -> None:
+        controller = _controller()
+        pose = Pose2D(0.0, 0.0, 0.0)
+        ball = BallState(x=2.0, y=0.0, last_seen_at=1.0)
+        context = _context(
+            pose,
+            opponent_pose=Pose2D(1.3, 0.0, 0.0),
+            ball=ball,
+        )
+
+        command = controller.move_to_target(
+            1,
+            context,
+            Pose2D(2.0, 0.0, 0.0),
+            "contest ball",
+            contest_ball=ball,
+        )
+
+        self.assertIsInstance(command.intent, MoveIntent)
+        assert isinstance(command.intent, MoveIntent)
+        self.assertGreater(command.intent.vx, 0.0)
+        self.assertEqual(command.intent.vyaw, 0.0)
+        self.assertNotIn("obstacle", command.reason)
+        self.assertNotIn("yaw avoid", command.reason)
+
     def test_target_inside_goal_is_projected_back_into_field(self) -> None:
         controller = _controller()
 
@@ -320,6 +345,51 @@ class GoalFrameRecoveryTests(unittest.TestCase):
         target = Pose2D(-6.60, 0.0, 0.0)
 
         self.assertEqual(controller._project_out_of_goal(target), target)
+
+    def test_live_goal_defense_suppresses_infield_post_escape(self) -> None:
+        controller = _controller()
+        pose = Pose2D(-6.95, 1.28, 0.0)
+        context = _context(
+            pose,
+            ball=BallState(x=-5.2, y=0.7, last_seen_at=1.0, vx=-1.5),
+        )
+
+        command = controller.move_to_target(
+            1,
+            context,
+            Pose2D(-6.1, 0.7, 0.0),
+            "goalkeeper block line",
+            goal_defense_active=True,
+        )
+
+        self.assertNotIn("escape goal frame", command.reason)
+
+    def test_keeper_behind_line_still_escapes_during_live_defense(self) -> None:
+        controller = _controller()
+        pose = Pose2D(-7.15, 0.0, 0.0)
+        context = _context(
+            pose,
+            ball=BallState(x=-6.0, y=0.0, last_seen_at=1.0, vx=-1.5),
+        )
+
+        command = controller.move_to_target(
+            1,
+            context,
+            Pose2D(-6.1, 0.0, 0.0),
+            "goalkeeper block line",
+            goal_defense_active=True,
+        )
+
+        self.assertIn("escape goal frame", command.reason)
+
+    def test_approach_target_respects_kick_direction(self) -> None:
+        controller = _controller()
+        ball = BallState(x=0.0, y=0.0, last_seen_at=1.0)
+
+        target = controller.approach_target(ball, math.pi / 2.0, 0.4)
+
+        self.assertAlmostEqual(target.x, 0.0, places=6)
+        self.assertAlmostEqual(target.y, -0.4, places=6)
 
 
 if __name__ == "__main__":

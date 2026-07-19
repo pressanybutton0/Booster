@@ -10,6 +10,8 @@ from src.play.playbook import (
     ROLE_CHASER,
     ROLE_DEFENDER,
     ROLE_GOALKEEPER,
+    ROLE_NONE,
+    ROLE_SUPPORTER,
 )
 from src.play.strategy_profiles import StrategyProfile
 from src.soccer_framework import (
@@ -32,11 +34,34 @@ from src.tactics.targeting.restart import opponent_restart_target
 
 
 class _FakeTargeting:
-    def ball_in_own_defensive_area(self, _ball: BallState) -> bool:
-        return False
+    def ball_in_own_defensive_area(
+        self,
+        _ball: BallState,
+        extra_margin_m: float = 0.0,
+    ) -> bool:
+        return _ball.x <= -4.0 + extra_margin_m
 
     def side_should_challenge(self, _context: PlayContext) -> bool:
         return True
+
+    def keeper_should_sweep_loose_ball(
+        self,
+        context: PlayContext,
+        keeper_id: int,
+        *,
+        continuing: bool = False,
+    ) -> bool:
+        del continuing
+        keeper = context.teammates.get(keeper_id)
+        if keeper is None or keeper.pose is None or not context.opponents:
+            return False
+        ball = context.known_ball
+        nearest_opponent = min(
+            math.hypot(robot.pose.x - ball.x, robot.pose.y - ball.y)
+            for robot in context.opponents.values()
+            if robot.pose is not None
+        )
+        return -4.0 < ball.x <= -2.5 and nearest_opponent >= 0.85
 
     def ball_claim_score(
         self,
@@ -60,8 +85,14 @@ class _FakeKit:
 
 
 class _FakeKicker:
+    def __init__(self) -> None:
+        self.active_players: set[int] = set()
+
     def configure(self, enter: float, exit: float, exit_delay: float) -> None:
         self.values = (enter, exit, exit_delay)
+
+    def is_active(self, player_id: int) -> bool:
+        return player_id in self.active_players
 
 
 def _context(
@@ -71,7 +102,11 @@ def _context(
     opponent_score: int = 0,
     secs_remaining: int = 600,
     ball_x: float = 0.0,
+    ball_y: float = 0.0,
     teammate_xy: dict[int, tuple[float, float]] | None = None,
+    opponent_xy: dict[int, tuple[float, float]] | None = None,
+    set_play: SetPlay = SetPlay.NONE,
+    kicking_team: int = 0,
 ) -> PlayContext:
     penalties = penalties or {}
     teammate_xy = teammate_xy or {
@@ -85,6 +120,8 @@ def _context(
     ]
     game = GameControlState(
         state=GameState.PLAYING,
+        set_play=set_play,
+        kicking_team=kicking_team,
         secs_remaining=secs_remaining,
         teams=[
             TeamState(team_number=1, score=own_score, players=own_players),
@@ -93,7 +130,7 @@ def _context(
     )
     return PlayContext(
         game_state=game,
-        ball=BallState(x=ball_x, y=0.0, last_seen_at=1.0),
+        ball=BallState(x=ball_x, y=ball_y, last_seen_at=1.0),
         teammates={
             player_id: RobotState(
                 player_id,
@@ -101,6 +138,10 @@ def _context(
                 1.0,
             )
             for player_id, (x, y) in teammate_xy.items()
+        },
+        opponents={
+            player_id: RobotState(player_id, Pose2D(x, y, 0.0), 1.0)
+            for player_id, (x, y) in (opponent_xy or {}).items()
         },
     )
 
@@ -135,6 +176,41 @@ class CompetitionRuleTests(unittest.TestCase):
             StrategyProfile.DEFENSIVE,
         )
         self.assertIn(ROLE_DEFENDER, assignment.by_player.values())
+
+    def test_keeper_exclusively_owns_ball_in_defensive_area(self) -> None:
+        playbook = DefaultPlaybook(_FakeKit(SoccerConfig()))
+
+        assignment = playbook.assign_roles(_context(ball_x=-5.0))
+
+        self.assertEqual(assignment.ball_owner_id, 3)
+        self.assertTrue(assignment.owns_ball(3))
+        self.assertNotIn(ROLE_CHASER, assignment.by_player.values())
+        self.assertEqual(assignment.role_of(2), ROLE_DEFENDER)
+
+    def test_keeper_ball_claim_uses_exit_hysteresis(self) -> None:
+        playbook = DefaultPlaybook(_FakeKit(SoccerConfig()))
+
+        entered = playbook.assign_roles(_context(ball_x=-4.2))
+        still_owned = playbook.assign_roles(_context(ball_x=-3.8))
+        released = playbook.assign_roles(_context(ball_x=-3.5))
+
+        self.assertEqual(entered.ball_owner_id, 3)
+        self.assertEqual(still_owned.ball_owner_id, 3)
+        self.assertNotEqual(released.ball_owner_id, 3)
+
+    def test_robot2_is_defensive_pivot_when_robot1_owns_ball(self) -> None:
+        playbook = DefaultPlaybook(_FakeKit(SoccerConfig()))
+
+        assignment = playbook.assign_roles(
+            _context(
+                ball_x=1.0,
+                teammate_xy={1: (0.8, 0.0), 2: (-0.5, 1.0), 3: (-6.0, 0.0)},
+            )
+        )
+
+        self.assertEqual(assignment.ball_owner_id, 1)
+        self.assertEqual(assignment.role_of(1), ROLE_CHASER)
+        self.assertEqual(assignment.role_of(2), ROLE_DEFENDER)
 
     def test_final_third_switches_to_precision_profile(self) -> None:
         playbook = DefaultPlaybook(_FakeKit(SoccerConfig()))
@@ -176,7 +252,7 @@ class CompetitionRuleTests(unittest.TestCase):
         self.assertEqual(assignment.role_of(2), ROLE_GOALKEEPER)
         self.assertEqual(assignment.role_of(1), ROLE_CHASER)
 
-    def test_chaser_hysteresis_preserves_incumbent_until_challenger_is_clear(self) -> None:
+    def test_chaser_handoff_is_fast_until_the_incumbent_starts_kicking(self) -> None:
         playbook = DefaultPlaybook(_FakeKit(SoccerConfig()))
 
         initial = playbook.assign_roles(
@@ -184,17 +260,61 @@ class CompetitionRuleTests(unittest.TestCase):
         )
         self.assertEqual(initial.role_of(1), ROLE_CHASER)
 
-        # Player 2 is only 0.05 score units better, inside the 0.25 m fluid
-        # profile tie band, so the active kick owner must not be replaced.
+        # Player 2 is 0.05 score units better. Before a kick starts this exceeds
+        # the narrow idle band and ownership transfers immediately.
         near_tie = playbook.assign_roles(
             _context(teammate_xy={1: (-1.0, 0.0), 2: (-0.85, 0.0), 3: (-6.0, 0.0)})
         )
-        self.assertEqual(near_tie.role_of(1), ROLE_CHASER)
+        self.assertEqual(near_tie.role_of(2), ROLE_CHASER)
+
+        # Once player 2 is actually kicking, the wider tie band protects the
+        # action from a one-frame role reversal.
+        playbook.kit.kicker.active_players.add(2)
+        protected = playbook.assign_roles(
+            _context(teammate_xy={1: (-0.75, 0.0), 2: (-0.90, 0.0), 3: (-6.0, 0.0)})
+        )
+        self.assertEqual(protected.role_of(2), ROLE_CHASER)
 
         clear_winner = playbook.assign_roles(
             _context(teammate_xy={1: (-1.0, 0.0), 2: (-0.3, 0.0), 3: (-6.0, 0.0)})
         )
         self.assertEqual(clear_winner.role_of(2), ROLE_CHASER)
+
+    def test_goal_kick_is_one_touch_with_wide_receivers(self) -> None:
+        playbook = DefaultPlaybook(_FakeKit(SoccerConfig()))
+        initial = playbook.assign_roles(
+            _context(
+                ball_x=-5.7,
+                set_play=SetPlay.GOAL_KICK,
+                kicking_team=1,
+            )
+        )
+        touched = playbook.assign_roles(
+            _context(
+                ball_x=-5.20,
+                set_play=SetPlay.GOAL_KICK,
+                kicking_team=1,
+            )
+        )
+
+        self.assertEqual(initial.ball_owner_id, 3)
+        self.assertEqual(initial.role_of(1), ROLE_SUPPORTER)
+        self.assertEqual(initial.role_of(2), ROLE_DEFENDER)
+        self.assertIsNone(touched.ball_owner_id)
+        self.assertEqual(touched.role_of(3), ROLE_NONE)
+
+    def test_keeper_sweeps_loose_one_on_one_ball(self) -> None:
+        playbook = DefaultPlaybook(_FakeKit(SoccerConfig()))
+        assignment = playbook.assign_roles(
+            _context(
+                ball_x=-3.4,
+                teammate_xy={1: (0.0, 0.0), 2: (-0.5, 1.0), 3: (-5.8, 0.0)},
+                opponent_xy={1: (-2.4, 0.0)},
+            )
+        )
+
+        self.assertEqual(assignment.ball_owner_id, 3)
+        self.assertNotIn(ROLE_CHASER, assignment.by_player.values())
 
     def test_chaser_hysteresis_drops_an_ineligible_incumbent(self) -> None:
         playbook = DefaultPlaybook(_FakeKit(SoccerConfig()))

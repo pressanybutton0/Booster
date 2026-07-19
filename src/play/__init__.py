@@ -20,6 +20,7 @@ from .default_roles import (
 from .nodes import (
     AssignRoles,
     AttackSubtreeConfig,
+    IsBallOwner,
     IsRole,
     IsKickWanted,
     KickAction,
@@ -53,6 +54,7 @@ PLAYBOOKS.register("default", DefaultPlaybook, default=True)
 __all__ = [
     "AssignRoles",
     "AttackSubtreeConfig",
+    "IsBallOwner",
     "ChaserRole",
     "DefaultPlaybook",
     "DefenderRole",

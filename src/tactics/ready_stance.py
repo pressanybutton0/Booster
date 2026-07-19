@@ -169,8 +169,24 @@ class ReadyStance:
         ball: BallState | None,
     ) -> Pose2D:
         """Goalkeeper guard formula; the default goalkeeper role calls this."""
-        keeper_x = self.field.own_goal_x() + self.config.goal_area_length + 0.50
-        keeper_y = clamp((ball.y * 0.38) if ball else 0.0, -1.35, 1.35)
+        own_goal_x = self.field.own_goal_x()
+        keeper_x = own_goal_x + self.config.strategy.goalkeeper_block_offset_m
+        if ball is None:
+            keeper_y = 0.0
+        else:
+            # Stand on the ray between the ball and the centre of goal.  The old
+            # fixed ``ball.y * 0.38`` over-shifted for distant balls and exposed
+            # the opposite post.
+            distance_from_goal = max(
+                ball.x - own_goal_x,
+                self.config.strategy.goalkeeper_block_offset_m,
+            )
+            ray_ratio = (
+                self.config.strategy.goalkeeper_block_offset_m
+                / distance_from_goal
+            )
+            max_y = max(0.0, self.config.goal_width / 2.0 - 0.28)
+            keeper_y = clamp(ball.y * ray_ratio, -max_y, max_y)
         return Pose2D(
             keeper_x,
             keeper_y,

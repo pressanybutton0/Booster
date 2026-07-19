@@ -16,6 +16,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 
 
 __all__ = [
@@ -201,9 +202,18 @@ class BallState:
     y: float = 0.0
     last_seen_at: float = 0.0
     confidence: float = 1.0
+    # Team-frame velocity estimated by the observation adapter.  Keeping it on
+    # the shared snapshot lets tactics distinguish a shot travelling toward our
+    # goal from a stationary ball in the same position.
+    vx: float = 0.0
+    vy: float = 0.0
 
     def is_recent(self, now: float, max_age_sec: float = 1.5) -> bool:
         return self.last_seen_at > 0.0 and now - self.last_seen_at <= max_age_sec
+
+    @property
+    def speed(self) -> float:
+        return math.hypot(self.vx, self.vy)
 
 
 @dataclass

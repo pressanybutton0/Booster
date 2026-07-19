@@ -168,6 +168,9 @@ def _ball_record(ball: BallState | None, now: float) -> dict[str, object] | None
     return {
         "x": round(ball.x, 3),
         "y": round(ball.y, 3),
+        "vx": round(ball.vx, 3),
+        "vy": round(ball.vy, 3),
+        "speed": round(ball.speed, 3),
         "age_sec": round(max(0.0, now - ball.last_seen_at), 3),
         "confidence": round(ball.confidence, 3),
     }
@@ -351,11 +354,21 @@ class SoccerTeamRuntime(TeamCommandExecutor):
         self._last_command_log_at = now
         game_state = context.game_state
         state = game_state.state.value if game_state else "NONE"
+        role_assignment = (
+            self.tree.last_role_assignment
+            if game_state is not None and game_state.state == GameState.PLAYING
+            else None
+        )
+        ball_owner_id = (
+            role_assignment.ball_owner_id if role_assignment is not None else None
+        )
         reasons = ", ".join(
             f"p{player_id}:{command.reason}" for player_id, command in commands.items()
         )
         self._logger.info(
-            f"Soccer control state={state} {reasons}",
+            f"Soccer control state={state} ball_owner="
+            f"{('p' + str(ball_owner_id)) if ball_owner_id is not None else 'none'} "
+            f"{reasons}",
             event="control_summary",
             team_id=self.config.team_id,
             state=state,
@@ -363,6 +376,7 @@ class SoccerTeamRuntime(TeamCommandExecutor):
             set_play=game_state.set_play.value if game_state else None,
             stopped=game_state.stopped if game_state else None,
             kicking_team=game_state.kicking_team if game_state else None,
+            ball_owner_id=ball_owner_id,
             ball=_ball_record(context.ball, now),
             players=[
                 _robot_record(robot, game_state, self.config, commands.get(player_id), now)

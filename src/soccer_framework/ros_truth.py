@@ -253,11 +253,28 @@ class RosTruthProvider(PlayContextProvider):
 
     def _ball_callback(self, msg: Any) -> None:
         now = time.monotonic()
-        ball = BallState(
-            x=float(msg.x),
-            y=float(msg.y),
-            last_seen_at=now,
-            confidence=1.0,
-        )
+        x = float(msg.x)
+        y = float(msg.y)
         with self._lock:
-            self._ball = ball
+            previous = self._ball
+            vx = 0.0
+            vy = 0.0
+            if previous is not None:
+                dt = now - previous.last_seen_at
+                # Reject duplicate callbacks and long gaps.  A modest low-pass
+                # filter removes simulator pose jitter without delaying a shot
+                # enough to make the keeper react a frame late.
+                if 0.005 <= dt <= 0.50:
+                    raw_vx = (x - previous.x) / dt
+                    raw_vy = (y - previous.y) / dt
+                    alpha = 0.55
+                    vx = alpha * raw_vx + (1.0 - alpha) * previous.vx
+                    vy = alpha * raw_vy + (1.0 - alpha) * previous.vy
+            self._ball = BallState(
+                x=x,
+                y=y,
+                last_seen_at=now,
+                confidence=1.0,
+                vx=vx,
+                vy=vy,
+            )

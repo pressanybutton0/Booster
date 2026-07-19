@@ -12,6 +12,13 @@ to the playbook layer in :mod:`src.play.playbook`.
 
 from .kick_hysteresis import KickHysteresis
 from .geometry import TeamFieldFrame
+from .goalkeeper import (
+    GoalkeeperStateMachine,
+    KeeperPhase,
+    KeeperPlan,
+    ShotProjection,
+    project_shot_to_x,
+)
 from .motion import MotionController
 from .navigation import Obstacle, ObstacleCollector
 from .ready_stance import ReadyStance
@@ -19,10 +26,15 @@ from .targeting import Targeting
 
 __all__ = [
     "KickHysteresis",
+    "GoalkeeperStateMachine",
+    "KeeperPhase",
+    "KeeperPlan",
     "MotionController",
     "Obstacle",
     "ObstacleCollector",
     "ReadyStance",
     "Targeting",
     "TeamFieldFrame",
+    "ShotProjection",
+    "project_shot_to_x",
 ]

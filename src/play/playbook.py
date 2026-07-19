@@ -48,6 +48,10 @@ class RoleAssignment:
     """
 
     by_player: Mapping[int, str] = field(default_factory=dict)
+    # The only robot allowed to start SoccerKickManager this tick.  Keeping the
+    # claim beside the role snapshot makes arbitration atomic: roles and ball
+    # ownership can never describe different frames.
+    ball_owner_id: int | None = None
 
     def __post_init__(self) -> None:
         # Freeze as a read-only view so external by_player edits cannot change ``role_of`` behavior.
@@ -58,6 +62,9 @@ class RoleAssignment:
 
     def players_of(self, name: str) -> tuple[int, ...]:
         return tuple(pid for pid, role in self.by_player.items() if role == name)
+
+    def owns_ball(self, player_id: int) -> bool:
+        return self.ball_owner_id == player_id
 
 
 class Playbook:
@@ -163,6 +170,9 @@ class DefaultPlaybook(Playbook):
         # Without this state, tiny pose updates can swap chaser/support roles on
         # consecutive ticks and abort an otherwise healthy kick sequence.
         self._last_chaser_id: int | None = None
+        self._keeper_claiming = False
+        self._goal_kick_origin: tuple[float, float] | None = None
+        self._goal_kick_complete = False
 
     def assign_roles(self, context: PlayContext) -> RoleAssignment:
         """Assign only players that GameControl currently allows on the field.
@@ -176,10 +186,61 @@ class DefaultPlaybook(Playbook):
         profile = self.strategy_manager.update(context)
         eligible = self._eligible_players(context)
         goalkeeper_id = self._select_goalkeeper(context, eligible)
-        chaser_id = self.select_chaser(
+        own_goal_kick = self._is_own_goal_kick(context)
+        goal_kick_complete = self._track_goal_kick_touch(
             context,
-            eligible_players=eligible - ({goalkeeper_id} if goalkeeper_id else set()),
+            active=own_goal_kick,
         )
+        if own_goal_kick:
+            mapping: dict[int, str] = {}
+            for player_id in sorted(eligible):
+                if player_id == goalkeeper_id:
+                    mapping[player_id] = (
+                        ROLE_NONE if goal_kick_complete else ROLE_GOALKEEPER
+                    )
+                elif self.kit.config.ready_slot_for_player(player_id) == ReadySlot.SIDE:
+                    mapping[player_id] = ROLE_DEFENDER
+                else:
+                    mapping[player_id] = ROLE_SUPPORTER
+            self._last_chaser_id = None
+            self._keeper_claiming = not goal_kick_complete
+            return RoleAssignment(
+                mapping,
+                ball_owner_id=(
+                    goalkeeper_id
+                    if goalkeeper_id is not None and not goal_kick_complete
+                    else None
+                ),
+            )
+
+        goalkeeper_claims_ball = False
+        if goalkeeper_id is not None:
+            goalkeeper_claims_ball = self.kit.targeting.ball_in_own_defensive_area(
+                context.known_ball,
+                extra_margin_m=(
+                    self.kit.config.strategy.goalkeeper_clear_exit_margin_m
+                    if self._keeper_claiming
+                    else 0.0
+                ),
+            ) or self.kit.targeting.keeper_should_sweep_loose_ball(
+                context,
+                goalkeeper_id,
+                continuing=self._keeper_claiming,
+            )
+        self._keeper_claiming = goalkeeper_claims_ball
+        if goalkeeper_claims_ball:
+            # Nobody else is allowed to collapse into the keeper's working
+            # space.  Reset field-player hysteresis so the next open-ball claim
+            # is selected from fresh distances after the clearance.
+            chaser_id = None
+            self._last_chaser_id = None
+        else:
+            chaser_id = self.select_chaser(
+                context,
+                eligible_players=(
+                    eligible - ({goalkeeper_id} if goalkeeper_id else set())
+                ),
+            )
 
         mapping: dict[int, str] = {}
         for player_id in sorted(eligible):
@@ -187,12 +248,20 @@ class DefaultPlaybook(Playbook):
                 mapping[player_id] = ROLE_GOALKEEPER
             elif player_id == chaser_id:
                 mapping[player_id] = ROLE_CHASER
+            elif self.kit.config.ready_slot_for_player(player_id) == ReadySlot.SIDE:
+                # robot2 is the midfield/defensive pivot whenever it does not
+                # own the ball.  It protects the second ball rather than
+                # becoming a second striker beside robot1.
+                mapping[player_id] = ROLE_DEFENDER
             elif profile.value == "defensive":
                 mapping[player_id] = ROLE_DEFENDER
             else:
                 mapping[player_id] = ROLE_SUPPORTER
 
-        return RoleAssignment(mapping)
+        return RoleAssignment(
+            mapping,
+            ball_owner_id=(goalkeeper_id if goalkeeper_claims_ball else chaser_id),
+        )
 
     # Internals
 
@@ -282,18 +351,53 @@ class DefaultPlaybook(Playbook):
         ranked = sorted(scored, key=lambda item: item[0])
         best_score = ranked[0][0]
         score_by_player = {player_id: score for score, player_id in ranked}
+        incumbent_is_kicking = False
+        is_active = getattr(self.kit.kicker, "is_active", None)
+        if self._last_chaser_id is not None and callable(is_active):
+            incumbent_is_kicking = bool(is_active(self._last_chaser_id))
+        handoff_margin = (
+            tie_margin
+            if incumbent_is_kicking
+            else config.strategy.teammate_challenge_idle_margin_m
+        )
         if (
             self._last_chaser_id in score_by_player
-            and score_by_player[self._last_chaser_id] <= best_score + tie_margin
+            and score_by_player[self._last_chaser_id] <= best_score + handoff_margin
         ):
             return self._last_chaser_id
 
-        tied_ids = [
-            player_id for score, player_id in ranked if score <= best_score + tie_margin
-        ]
-        selected = min(tied_ids)
+        selected = ranked[0][1]
         self._last_chaser_id = selected
         return selected
+
+    def _is_own_goal_kick(self, context: PlayContext) -> bool:
+        game = context.known_game
+        return (
+            game.is_restart_for_team(self.kit.config.team_id)
+            and game.set_play.value == "GOAL_KICK"
+        )
+
+    def _track_goal_kick_touch(
+        self,
+        context: PlayContext,
+        *,
+        active: bool,
+    ) -> bool:
+        """Latch the first legal goal-kick touch until GameController clears it."""
+
+        if not active:
+            self._goal_kick_origin = None
+            self._goal_kick_complete = False
+            return False
+        ball = context.known_ball
+        if self._goal_kick_origin is None:
+            self._goal_kick_origin = (ball.x, ball.y)
+        if not self._goal_kick_complete:
+            dx = ball.x - self._goal_kick_origin[0]
+            dy = ball.y - self._goal_kick_origin[1]
+            if (dx * dx + dy * dy) ** 0.5 >= self.kit.config.strategy.restart_touch_distance:
+                self._goal_kick_complete = True
+        return self._goal_kick_complete
 
     def _slot_can_challenge(
         self,
